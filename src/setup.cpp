@@ -36,6 +36,323 @@ void main_setup() { // benchmark; required extensions in defines.hpp: BENCHMARK,
 #endif // BENCHMARK
 
 
+#ifndef BENCHMARK
+struct ForceValidationConfig {
+	float si_rho = 1.225f;
+	float si_nu = 1.48E-5f;
+	float lbm_u = 0.1f;
+	ulong init_steps = 1500ull;
+	uint sample_count = 10u;
+	ulong sample_interval = 50ull;
+};
+
+struct ForceValidationCase {
+	string name;
+	string stl_path;
+	float3x3 rotation;
+	float3 si_domain;
+	float3 si_mesh_size;
+	float si_u;
+	float si_ref_length;
+	float si_ref_area;
+	string ref_area_kind;
+	bool ground;
+	bool fit_mesh_to_domain;
+	float stl_scale;
+};
+
+static const ForceValidationConfig force_validation_config;
+static const float NACA_AOA_DEG = 0.0f;
+
+static string force_validation_csv_path(const string& name, const int memory_in_mb) {
+	return get_exe_path()+"export/force_validation/"+name+"_"+to_string(memory_in_mb)+"MB.csv";
+}
+
+static string csv_float(const float x) {
+	return to_string(x, 9u);
+}
+
+static string csv_uint3(const uint3& v) {
+	return to_string(v.x)+","+to_string(v.y)+","+to_string(v.z);
+}
+
+static string format_float3(const float3& v) {
+	return "("+csv_float(v.x)+","+csv_float(v.y)+","+csv_float(v.z)+")";
+}
+
+static void write_force_validation_header(const string& path) {
+	write_file(path, "case,memory_mb,Nx,Ny,Nz,step,time_s,Fx_N,Fy_drag_N,Fz_lift_N,Mx_Nm,My_Nm,Mz_Nm,Cd,Cl,Cs,Re,tau,nu_lbm,ref_area_m2,ref_length_m\n");
+}
+
+static float3 mesh_size(const Mesh* mesh) {
+	return mesh->pmax-mesh->pmin;
+}
+
+static float3 mesh_bounds_center(const Mesh* mesh) {
+	return 0.5f*(mesh->pmin+mesh->pmax);
+}
+
+static Mesh* read_preview_mesh(const string& path, const float3x3& rotation) {
+	print_info("Loading force-validation STL preview: "+path);
+	return read_stl(path, 1.0f, rotation);
+}
+
+static Mesh* read_lbm_mesh(const string& path, const float3x3& rotation) {
+	return read_stl(path, units.x(1.0f), rotation);
+}
+
+static Mesh* read_lbm_mesh(const ForceValidationCase& c, const uint3& lbm_N) {
+	if(c.fit_mesh_to_domain) return read_stl(c.stl_path, float3((float)lbm_N.x, (float)lbm_N.y, (float)lbm_N.z), float3(0.5f*(float)lbm_N.x, 0.5f*(float)lbm_N.y, 0.5f*(float)lbm_N.z), c.rotation, 0.0f);
+	if(c.stl_scale>0.0f) return read_stl(c.stl_path, units.x(1.0f)*c.stl_scale, c.rotation);
+	return read_lbm_mesh(c.stl_path, c.rotation);
+}
+
+static void place_mesh(Mesh* mesh, const float3& target_bounds_center) {
+	mesh->translate(target_bounds_center-mesh_bounds_center(mesh));
+}
+
+static void initialize_external_flow(LBM& lbm, const float lbm_u, const bool ground) {
+	const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz();
+	parallel_for(lbm.get_N(), [&](ulong n) {
+		uint x=0u, y=0u, z=0u;
+		lbm.coordinates(n, x, y, z);
+		if(ground&&z==0u) {
+			lbm.flags[n] = TYPE_S;
+		} else if(x==0u||x==Nx-1u||y==0u||y==Ny-1u||z==0u||z==Nz-1u) {
+			lbm.flags[n] = TYPE_E;
+		}
+		if((lbm.flags[n]&TYPE_S)==0u) lbm.u.y[n] = lbm_u;
+	});
+}
+
+static ulong count_cells_equal_flag(LBM& lbm, const uchar flag) {
+	lbm.flags.read_from_device();
+	ulong cells = 0ull;
+	for(ulong n=0ull; n<lbm.get_N(); n++) {
+		if(lbm.flags[n]==flag) cells++;
+	}
+	return cells;
+}
+
+static ulong count_cells_with_flag_bit(LBM& lbm, const uchar flag) {
+	lbm.flags.read_from_device();
+	ulong cells = 0ull;
+	for(ulong n=0ull; n<lbm.get_N(); n++) {
+		if((lbm.flags[n]&flag)==flag) cells++;
+	}
+	return cells;
+}
+
+static void append_force_sample(const ForceValidationCase& c, const int memory_in_mb, LBM& lbm, const float3& torque_center, const string& csv_path) {
+	const float3 lbm_force = lbm.object_force(TYPE_S|TYPE_X);
+	const float3 lbm_torque = lbm.object_torque(torque_center, TYPE_S|TYPE_X);
+	const float3 force = float3(units.si_F(lbm_force.x), units.si_F(lbm_force.y), units.si_F(lbm_force.z));
+	const float3 torque = float3(units.si_M(lbm_torque.x), units.si_M(lbm_torque.y), units.si_M(lbm_torque.z));
+	const float qA = 0.5f*force_validation_config.si_rho*sq(c.si_u)*c.si_ref_area;
+	const float Cd = qA>0.0f ? force.y/qA : 0.0f;
+	const float Cl = qA>0.0f ? force.z/qA : 0.0f;
+	const float Cs = qA>0.0f ? force.x/qA : 0.0f;
+	const float Re = units.si_Re(c.si_ref_length, c.si_u, force_validation_config.si_nu);
+	const string line = "FORCE_VALIDATION case="+c.name+
+		" memory_mb="+to_string(memory_in_mb)+
+		" step="+to_string(lbm.get_t())+
+		" Fx_N="+csv_float(force.x)+
+		" Fy_drag_N="+csv_float(force.y)+
+		" Fz_lift_N="+csv_float(force.z)+
+		" Mx_Nm="+csv_float(torque.x)+
+		" My_Nm="+csv_float(torque.y)+
+		" Mz_Nm="+csv_float(torque.z)+
+		" Cd="+csv_float(Cd)+
+		" Cl="+csv_float(Cl)+
+		" Cs="+csv_float(Cs);
+	print_info(line);
+	write_line(csv_path, c.name+","+to_string(memory_in_mb)+","+csv_uint3(uint3(lbm.get_Nx(), lbm.get_Ny(), lbm.get_Nz()))+","+
+		to_string(lbm.get_t())+","+csv_float(units.si_t(lbm.get_t()))+","+
+		csv_float(force.x)+","+csv_float(force.y)+","+csv_float(force.z)+","+
+		csv_float(torque.x)+","+csv_float(torque.y)+","+csv_float(torque.z)+","+
+		csv_float(Cd)+","+csv_float(Cl)+","+csv_float(Cs)+","+
+		csv_float(Re)+","+csv_float(lbm.get_tau())+","+csv_float(lbm.get_nu())+","+
+		csv_float(c.si_ref_area)+","+csv_float(c.si_ref_length));
+}
+
+static void run_force_validation_case(const ForceValidationCase& c, const int memory_in_mb) {
+	print_info("FORCE_VALIDATION_BEGIN case="+c.name+" memory_mb="+to_string(memory_in_mb)+" stl="+c.stl_path);
+	const uint3 lbm_N = resolution(c.si_domain, (uint)memory_in_mb);
+	units.set_m_kg_s((float)lbm_N.y, force_validation_config.lbm_u, 1.0f, c.si_domain.y, c.si_u, force_validation_config.si_rho);
+	const float lbm_nu = units.nu(force_validation_config.si_nu);
+	print_info("FORCE_VALIDATION_GRID case="+c.name+" Nx="+to_string(lbm_N.x)+" Ny="+to_string(lbm_N.y)+" Nz="+to_string(lbm_N.z)+" nu_lbm="+to_string(lbm_nu, 9u));
+	print_info("FORCE_VALIDATION_DOMAIN case="+c.name+" si_domain_m="+format_float3(c.si_domain)+" si_mesh_size_m="+format_float3(c.si_mesh_size));
+	print_info("FORCE_VALIDATION_REFERENCE case="+c.name+" ref_area_kind="+c.ref_area_kind+" ref_area_m2="+csv_float(c.si_ref_area)+" ref_length_m="+csv_float(c.si_ref_length));
+	print_info("FORCE_VALIDATION_RE case="+c.name+" Re="+to_string(to_uint(units.si_Re(c.si_ref_length, c.si_u, force_validation_config.si_nu))));
+	LBM lbm(lbm_N, lbm_nu);
+	Mesh* mesh = read_lbm_mesh(c, lbm_N);
+	print_info("FORCE_VALIDATION_MESH_LOADED case="+c.name+" pmin="+format_float3(mesh->pmin)+" pmax="+format_float3(mesh->pmax)+" size_cells="+format_float3(mesh_size(mesh)));
+	if(c.name=="ahmed") {
+		const float x_center = 0.5f*(float)lbm_N.x;
+		const float y_center = 0.5f*(float)lbm_N.y;
+		mesh->translate(float3(x_center-mesh_bounds_center(mesh).x, y_center-mesh_bounds_center(mesh).y, 1.0f-mesh->pmin.z));
+	} else if(!c.fit_mesh_to_domain) {
+		const float3 target_center = float3(0.5f*(float)lbm_N.x, 0.30f*(float)lbm_N.y, c.ground ? 0.0f : 0.5f*(float)lbm_N.z);
+		place_mesh(mesh, target_center);
+	}
+	if(c.ground&&c.name!="ahmed") mesh->translate(float3(0.0f, 0.0f, 1.0f-mesh->pmin.z));
+	print_info("FORCE_VALIDATION_MESH_PLACED case="+c.name+" pmin="+format_float3(mesh->pmin)+" pmax="+format_float3(mesh->pmax)+" size_cells="+format_float3(mesh_size(mesh)));
+	lbm.voxelize_mesh_on_device(mesh, TYPE_S|TYPE_X);
+	print_info("FORCE_VALIDATION_VOXELS case="+c.name+" exact_sx_cells="+to_string(count_cells_equal_flag(lbm, TYPE_S|TYPE_X))+" any_s_cells="+to_string(count_cells_with_flag_bit(lbm, TYPE_S))+" any_x_cells="+to_string(count_cells_with_flag_bit(lbm, TYPE_X)));
+	initialize_external_flow(lbm, force_validation_config.lbm_u, c.ground);
+#ifdef GRAPHICS
+	lbm.graphics.visualization_modes = VIS_FLAG_LATTICE|VIS_FLAG_SURFACE;
+	lbm.graphics.field_mode = 0;
+	lbm.graphics.slice_mode = 0;
+	if(c.name=="ahmed") lbm.graphics.set_camera_centered(35.0f, 25.0f, 80.0f, 1.0f);
+#endif // GRAPHICS
+	const string csv_path = force_validation_csv_path(c.name, memory_in_mb);
+	write_force_validation_header(csv_path);
+	lbm.run(force_validation_config.init_steps);
+	const float3 torque_center = lbm.object_center_of_mass(TYPE_S|TYPE_X);
+	for(uint i=0u; i<force_validation_config.sample_count; i++) {
+		lbm.run(force_validation_config.sample_interval);
+		append_force_sample(c, memory_in_mb, lbm, torque_center, csv_path);
+	}
+	print_info("FORCE_VALIDATION_END case="+c.name+" memory_mb="+to_string(memory_in_mb)+" csv="+csv_path);
+}
+
+static ForceValidationCase make_naca_case() {
+	const string path = get_exe_path()+"../stl/naca0012.stl";
+	const float3x3 align_chord = float3x3(float3(0.0f, 0.0f, 1.0f), radians(90.0f));
+	const float3x3 rotate_from_vertical = float3x3(float3(0.0f, 1.0f, 0.0f), radians(90.0f));
+	const float3x3 pitch = float3x3(float3(1.0f, 0.0f, 0.0f), radians(NACA_AOA_DEG));
+	const float3x3 rotation = pitch*rotate_from_vertical*align_chord;
+	Mesh* preview = read_preview_mesh(path, rotation);
+	const float3 s = mesh_size(preview);
+	delete preview;
+	const float chord = fmax(s.y, 1.0E-6f);
+	const float span = fmax(s.x, 0.1f*chord);
+	ForceValidationCase c;
+	c.name = "naca";
+	c.stl_path = path;
+	c.rotation = rotation;
+	c.si_mesh_size = s;
+	c.si_ref_length = chord;
+	c.si_ref_area = chord*span;
+	c.ref_area_kind = "chord_span";
+	c.si_u = force_validation_config.si_nu*4.0E6f/chord;
+	c.si_domain = float3(fmax(4.0f*span, 1.5f*chord), 8.0f*chord, 4.0f*chord);
+	c.ground = false;
+	c.fit_mesh_to_domain = false;
+	c.stl_scale = 0.0f;
+	return c;
+}
+
+static ForceValidationCase make_ahmed_case() {
+	const string path = get_exe_path()+"../stl/ahmed_25deg.stl";
+	const float3x3 rotation = float3x3(float3(0.0f, 0.0f, 1.0f), radians(90.0f));
+	const float width = 0.389f;
+	const float length = 1.044f;
+	const float height = 0.288f;
+	const float box_scale = 6.0f;
+	Mesh* preview = read_preview_mesh(path, rotation);
+	const float3 preview_size = mesh_size(preview);
+	delete preview;
+	const float axis_scale = length/fmax(preview_size.y, 1.0E-6f);
+	print_info("FORCE_VALIDATION_AHMED_STL preview_size="+format_float3(preview_size)+" stl_scale_to_m="+csv_float(axis_scale));
+	ForceValidationCase c;
+	c.name = "ahmed";
+	c.stl_path = path;
+	c.rotation = rotation;
+	c.si_mesh_size = float3(width, length, height);
+	c.si_ref_length = length;
+	c.si_ref_area = width*height;
+	c.ref_area_kind = "frontal_width_height";
+	c.si_u = 40.0f;
+	c.si_domain = float3(box_scale*width, box_scale*length, 0.5f*(box_scale-1.0f)*width+height);
+	c.ground = true;
+	c.fit_mesh_to_domain = false;
+	c.stl_scale = axis_scale;
+	return c;
+}
+
+static ForceValidationCase make_skijumper_case() {
+	const string path = get_exe_path()+"../stl/skijumper.stl";
+	const float3x3 rotation = float3x3(float3(1.0f, 0.0f, 0.0f), radians(90.0f));
+	Mesh* preview = read_preview_mesh(path, float3x3(1.0f));
+	const float3 raw_size = mesh_size(preview);
+	delete preview;
+	const float3 domain_from_dummy_bounds = 0.01f*float3(fmax(raw_size.x, 1.0E-6f), fmax(raw_size.z, 1.0E-6f), fmax(raw_size.y, 1.0E-6f));
+	const float ref_length = domain_from_dummy_bounds.y;
+	ForceValidationCase c;
+	c.name = "skijumper";
+	c.stl_path = path;
+	c.rotation = rotation;
+	c.si_mesh_size = domain_from_dummy_bounds;
+	c.si_ref_length = ref_length;
+	c.si_ref_area = fmax(domain_from_dummy_bounds.x*domain_from_dummy_bounds.z, 1.0E-6f);
+	c.ref_area_kind = "dummy_bounds_xz";
+	c.si_u = 25.0f;
+	c.si_domain = domain_from_dummy_bounds;
+	c.ground = false;
+	c.fit_mesh_to_domain = true;
+	c.stl_scale = 0.0f;
+	return c;
+}
+
+void sim_naca(int memory_in_mb) {
+	run_force_validation_case(make_naca_case(), memory_in_mb);
+}
+
+void sim_ahmed(int memory_in_mb) {
+	run_force_validation_case(make_ahmed_case(), memory_in_mb);
+}
+
+void sim_skijumper(int memory_in_mb) {
+	run_force_validation_case(make_skijumper_case(), memory_in_mb);
+}
+
+static void print_force_validation_usage() {
+	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [gpu_id ...]");
+	print_info("Defaults: all 2000 0");
+}
+
+void main_setup() {
+	string suite = "ahmed";
+	int memory_in_mb = 2000;
+	vector<string> gpu_arguments;
+	bool first_argument_is_memory = false;
+	if(main_arguments.size()>0u) {
+		const string arg0 = to_lower(main_arguments[0]);
+		if(is_number(arg0)) {
+			memory_in_mb = to_int(arg0);
+			first_argument_is_memory = true;
+		} else {
+			suite = arg0;
+		}
+	}
+	if(!first_argument_is_memory&&main_arguments.size()>1u&&is_number(main_arguments[1])) memory_in_mb = to_int(main_arguments[1]);
+	if(memory_in_mb<=0) print_error("Force-validation memory must be greater than 0 MB.");
+	const uint gpu_arg_begin = first_argument_is_memory ? 1u : 2u;
+	for(uint i=gpu_arg_begin; i<(uint)main_arguments.size(); i++) gpu_arguments.push_back(main_arguments[i]);
+	if(gpu_arguments.size()==0u) gpu_arguments.push_back("0");
+	main_arguments = gpu_arguments;
+	print_force_validation_usage();
+	if(suite=="all") {
+		sim_naca(memory_in_mb);
+		sim_ahmed(memory_in_mb);
+		sim_skijumper(memory_in_mb);
+	} else if(suite=="naca") {
+		sim_naca(memory_in_mb);
+	} else if(suite=="ahmed") {
+		sim_ahmed(memory_in_mb);
+	} else if(suite=="skijumper"||suite=="ski") {
+		sim_skijumper(memory_in_mb);
+	} else {
+		print_error("Unknown force-validation case \""+suite+"\".");
+	}
+#if defined(_WIN32)
+	wait();
+#endif // Windows
+}
+#endif // !BENCHMARK
+
 
 /*void main_setup() { // 3D Taylor-Green vortices; required extensions in defines.hpp: INTERACTIVE_GRAPHICS
 	// ################################################################## define simulation box size, viscosity and volume force ###################################################################
