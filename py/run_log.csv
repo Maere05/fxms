@@ -1,2 +1,1 @@
 timestamp,label,location,case,memory_mb,gpu_ids,status,notes,command
-2026-05-26T18:12:56,local-debug-skijumper-512mb,local-5080-16gb,ahmed,1000,0,failed,Small local smoke run from notebook,c:\dev\fxms\bin\FluidX3D.exe ahmed 1000 0

@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import math
+import os
 import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -10,6 +13,12 @@ from typing import Iterable, Sequence
 
 
 CASE_NAMES = ("all", "naca", "ahmed", "skijumper")
+RESEARCH_MEMORY_TIERS_MB = (20_000, 30_000, 40_000)
+TARGET_BANDS = {
+    "ahmed": {"Cd": (0.285, 0.298)},
+    "naca": {"Cd": (0.006, 0.008)},
+    "skijumper": {"Fy_drag_N": (40.0, 45.0), "Fz_lift_N": (28.0, 32.0)},
+}
 
 
 @dataclass
@@ -67,6 +76,14 @@ def command_for_local_run(spec: RunSpec, root: Path | None = None) -> list[str]:
     return [str(exe), spec.case, str(spec.memory_mb), *[str(gpu) for gpu in spec.gpu_ids]]
 
 
+def command_for_local_build(root: Path | None = None) -> list[str]:
+    root = repo_root() if root is None else Path(root)
+    if os.name == "nt":
+        msbuild = shutil.which("MSBuild.exe") or "MSBuild.exe"
+        return [msbuild, str(root / "FluidX3D.sln"), "/p:Configuration=Release", "/p:Platform=x64"]
+    return ["make", "Linux"]
+
+
 def command_for_remote_run(spec: RunSpec, remote: RemoteConfig) -> str:
     spec.validate()
     args = " ".join(shlex.quote(str(x)) for x in [spec.case, spec.memory_mb, *spec.gpu_ids])
@@ -80,6 +97,14 @@ def run_local(spec: RunSpec, root: Path | None = None, dry_run: bool = True) -> 
     result = subprocess.run(cmd, cwd=repo_root() if root is None else Path(root), text=True, capture_output=True)
     append_run_log(spec, status="ok" if result.returncode == 0 else "failed", command=" ".join(cmd), root=root)
     return result
+
+
+def build_local(root: Path | None = None, dry_run: bool = True) -> subprocess.CompletedProcess[str] | list[str]:
+    root = repo_root() if root is None else Path(root)
+    cmd = command_for_local_build(root)
+    if dry_run:
+        return cmd
+    return subprocess.run(cmd, cwd=root, text=True, capture_output=True)
 
 
 def run_remote(spec: RunSpec, remote: RemoteConfig, dry_run: bool = True) -> subprocess.CompletedProcess[str] | list[str]:
@@ -165,3 +190,93 @@ def latest_samples(df):
     if df.empty:
         return df
     return df.sort_values("step").groupby(["case", "memory_mb", "source_file"], as_index=False).tail(1)
+
+
+def target_band_checks(df):
+    import pandas as pd
+
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    latest = latest_samples(df)
+    for _, row in latest.iterrows():
+        for metric, (target_min, target_max) in TARGET_BANDS.get(row["case"], {}).items():
+            value = row.get(metric)
+            rows.append(
+                {
+                    "case": row["case"],
+                    "memory_mb": row["memory_mb"],
+                    "source_file": row["source_file"],
+                    "metric": metric,
+                    "value": value,
+                    "target_min": target_min,
+                    "target_max": target_max,
+                    "in_band": target_min <= value <= target_max if pd.notna(value) else False,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def grid_independence_checks(df, low_memory_mb: int = 20_000, high_memory_mb: int = 40_000, tolerance: float = 0.05):
+    import pandas as pd
+
+    if df.empty:
+        return pd.DataFrame()
+    rows = []
+    metrics = ("Cd", "Cl")
+    means = df.groupby(["case", "memory_mb"], dropna=False)[list(metrics)].mean(numeric_only=True).reset_index()
+    for case in sorted(means["case"].dropna().unique()):
+        low = means[(means["case"] == case) & (means["memory_mb"] == low_memory_mb)]
+        high = means[(means["case"] == case) & (means["memory_mb"] == high_memory_mb)]
+        if low.empty or high.empty:
+            continue
+        for metric in metrics:
+            low_value = float(low.iloc[0][metric])
+            high_value = float(high.iloc[0][metric])
+            denom = max(abs(high_value), 1.0e-12)
+            rel_delta = abs(low_value - high_value) / denom
+            rows.append(
+                {
+                    "case": case,
+                    "metric": metric,
+                    "low_memory_mb": low_memory_mb,
+                    "high_memory_mb": high_memory_mb,
+                    "low_value": low_value,
+                    "high_value": high_value,
+                    "relative_delta": rel_delta,
+                    "tolerance": tolerance,
+                    "passes": rel_delta <= tolerance,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def divergence_checks(df, growth_ratio_limit: float = 10.0):
+    import pandas as pd
+
+    if df.empty:
+        return pd.DataFrame()
+    metrics = ["Fx_N", "Fy_drag_N", "Fz_lift_N", "Cd", "Cl", "Cs"]
+    rows = []
+    for (case, memory_mb, source_file), run_df in df.sort_values("step").groupby(["case", "memory_mb", "source_file"], dropna=False):
+        for metric in metrics:
+            values = [float(v) for v in run_df[metric].dropna()] if metric in run_df else []
+            finite = all(math.isfinite(v) for v in values)
+            growth_ratio = 0.0
+            if len(values) >= 2:
+                first = max(abs(values[0]), 1.0e-12)
+                last = abs(values[-1])
+                growth_ratio = last / first
+            rows.append(
+                {
+                    "case": case,
+                    "memory_mb": memory_mb,
+                    "source_file": source_file,
+                    "metric": metric,
+                    "finite": finite,
+                    "growth_ratio": growth_ratio,
+                    "growth_ratio_limit": growth_ratio_limit,
+                    "passes": finite and growth_ratio <= growth_ratio_limit,
+                }
+            )
+    return pd.DataFrame(rows)

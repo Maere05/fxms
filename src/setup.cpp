@@ -41,8 +41,8 @@ struct ForceValidationConfig {
 	float si_rho = 1.225f;
 	float si_nu = 1.48E-5f;
 	float lbm_u = 0.1f;
-	ulong init_steps = 1500ull;
-	uint sample_count = 10u;
+	ulong init_steps = 2000ull;
+	uint sample_count = 20u;
 	ulong sample_interval = 50ull;
 };
 
@@ -80,8 +80,32 @@ static string format_float3(const float3& v) {
 	return "("+csv_float(v.x)+","+csv_float(v.y)+","+csv_float(v.z)+")";
 }
 
+static string wall_model_name() {
+#ifdef WALL_MODEL_SVBB
+	return "svbb";
+#else // WALL_MODEL_SVBB
+	return "off";
+#endif // WALL_MODEL_SVBB
+}
+
+static float wall_model_ww_A() {
+#ifdef WALL_MODEL_SVBB
+	return WALL_WERNER_WENGLE_A;
+#else // WALL_MODEL_SVBB
+	return 0.0f;
+#endif // WALL_MODEL_SVBB
+}
+
+static float wall_model_ww_B() {
+#ifdef WALL_MODEL_SVBB
+	return WALL_WERNER_WENGLE_B;
+#else // WALL_MODEL_SVBB
+	return 0.0f;
+#endif // WALL_MODEL_SVBB
+}
+
 static void write_force_validation_header(const string& path) {
-	write_file(path, "case,memory_mb,Nx,Ny,Nz,step,time_s,Fx_N,Fy_drag_N,Fz_lift_N,Mx_Nm,My_Nm,Mz_Nm,Cd,Cl,Cs,Re,tau,nu_lbm,ref_area_m2,ref_length_m\n");
+	write_file(path, "case,memory_mb,Nx,Ny,Nz,step,time_s,Fx_N,Fy_drag_N,Fz_lift_N,Mx_Nm,My_Nm,Mz_Nm,Cd,Cl,Cs,Re,tau,nu_lbm,ref_area_m2,ref_length_m,wall_model,ww_A,ww_B\n");
 }
 
 static float3 mesh_size(const Mesh* mesh) {
@@ -172,7 +196,8 @@ static void append_force_sample(const ForceValidationCase& c, const int memory_i
 		csv_float(torque.x)+","+csv_float(torque.y)+","+csv_float(torque.z)+","+
 		csv_float(Cd)+","+csv_float(Cl)+","+csv_float(Cs)+","+
 		csv_float(Re)+","+csv_float(lbm.get_tau())+","+csv_float(lbm.get_nu())+","+
-		csv_float(c.si_ref_area)+","+csv_float(c.si_ref_length));
+		csv_float(c.si_ref_area)+","+csv_float(c.si_ref_length)+","+
+		wall_model_name()+","+csv_float(wall_model_ww_A())+","+csv_float(wall_model_ww_B()));
 }
 
 static void run_force_validation_case(const ForceValidationCase& c, const int memory_in_mb) {
@@ -245,7 +270,7 @@ static ForceValidationCase make_naca_case() {
 }
 
 static ForceValidationCase make_ahmed_case() {
-	const string path = get_exe_path()+"../stl/ahmed_25deg.stl";
+	const string path = get_exe_path()+"../stl/ahmed_25deg_m.stl";
 	const float3x3 rotation = float3x3(float3(0.0f, 0.0f, 1.0f), radians(90.0f));
 	const float width = 0.389f;
 	const float length = 1.044f;
@@ -310,7 +335,7 @@ void sim_skijumper(int memory_in_mb) {
 
 static void print_force_validation_usage() {
 	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [gpu_id ...]");
-	print_info("Defaults: all 2000 0");
+	print_info("Defaults: ahmed 2000 0");
 }
 
 void main_setup() {
@@ -347,9 +372,6 @@ void main_setup() {
 	} else {
 		print_error("Unknown force-validation case \""+suite+"\".");
 	}
-#if defined(_WIN32)
-	wait();
-#endif // Windows
 }
 #endif // !BENCHMARK
 

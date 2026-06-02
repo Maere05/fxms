@@ -1101,6 +1101,26 @@ string opencl_c_container() { return R( // ########################## begin of O
 } // calculate_forcing_terms()
 )+"#endif"+R( // VOLUME_FORCE
 
+)+R(float calculate_relaxation_rate(const float* fhn, const float* feq, const float rhon) { // local relaxation rate, including Smagorinsky-Lilly if enabled
+	float w = def_w;
+)+"#ifdef SUBGRID"+R(
+	{ // Smagorinsky-Lilly subgrid turbulence model, source: https://arxiv.org/pdf/comp-gas/9401004.pdf
+		const float tau0 = 1.0f/w;
+		float Hxx=0.0f, Hyy=0.0f, Hzz=0.0f, Hxy=0.0f, Hxz=0.0f, Hyz=0.0f; // non-equilibrium stress tensor
+		for(uint i=1u; i<def_velocity_set; i++) {
+			const float fneqi = fhn[i]-feq[i];
+			const float cxi=c(i), cyi=c(def_velocity_set+i), czi=c(2u*def_velocity_set+i);
+			Hxx += cxi*cxi*fneqi; // symmetric tensor
+			Hxy += cxi*cyi*fneqi; Hyy += cyi*cyi*fneqi;
+			Hxz += cxi*czi*fneqi; Hyz += cyi*czi*fneqi; Hzz += czi*czi*fneqi;
+		}
+		const float Q = sq(Hxx)+sq(Hyy)+sq(Hzz)+2.0f*(sq(Hxy)+sq(Hxz)+sq(Hyz));
+		w = 2.0f/(tau0+sqrt(sq(tau0)+18.0f*1.41421356f*sq(def_smagorinsky_C)*sqrt(Q)/rhon));
+	}
+)+"#endif"+R( // SUBGRID
+	return w;
+} // calculate_relaxation_rate()
+
 )+"#ifdef MOVING_BOUNDARIES"+R(
 )+R(void apply_moving_boundaries(float* fhn, const uxx* j, const global float* u, const global uchar* flags) { // apply Dirichlet velocity boundaries if necessary (Krueger p.180, rho_solid=1)
 	uxx ji; // reads velocities of only neighboring boundary cells, which do not change during simulation
@@ -1111,6 +1131,61 @@ string opencl_c_container() { return R( // ########################## begin of O
 	}
 } // apply_moving_boundaries()
 )+"#endif"+R( // MOVING_BOUNDARIES
+
+)+"#ifdef WALL_MODEL_SVBB"+R(
+)+R(bool has_solid_neighbor(const uxx* j, const global uchar* flags) {
+	bool next_to_solid = false;
+	for(uint i=1u; i<def_velocity_set; i++) next_to_solid = next_to_solid||((flags[j[i]]&TYPE_BO)==TYPE_S);
+	return next_to_solid;
+}
+)+R(float wall_link_distance(const uint i) {
+	const float cx=c(i), cy=c(def_velocity_set+i), cz=c(2u*def_velocity_set+i);
+	return 0.5f*sqrt(fma(cx, cx, fma(cy, cy, cz*cz)));
+}
+)+R(float3 wall_link_normal(const uint link_i) {
+	const float3 e = (float3)(c(link_i), c(def_velocity_set+link_i), c(2u*def_velocity_set+link_i));
+	const float e_len = length(e);
+	return e_len>1.0E-8f ? e/e_len : (float3)(0.0f, 0.0f, 0.0f);
+}
+)+R(float werner_wengle_tau(const float rho, const float ut, const float nu0, const float y) {
+	const float inv_y = 1.0f/fmax(y, 1.0E-8f);
+	const float nu_over_y = fmax(nu0, 1.0E-8f)*inv_y;
+	const float B = def_wall_ww_B;
+	const float u_switch = 0.5f*nu_over_y*pow(def_wall_ww_A, 2/(1-B));
+	if(ut<=u_switch) return 2.0f*rho*nu_over_y*ut;
+	const float term = 0.5f*(1-B)*pow(def_wall_ww_A, (1+B)/(1-B))*pow(nu_over_y, 1+B) + (1+B)/def_wall_ww_A*pow(nu_over_y, B)*ut;
+	return rho*pow(fmax(term, 0.0f), 2/(1+B));
+}
+)+R(float3 svbb_wall_velocity(const float3 ut, const float ut_mag, const float rhoB, const float nu_eff, const float y) {
+	if(ut_mag<=1.0E-8f) return (float3)(0.0f, 0.0f, 0.0f);
+	const float tau_w = werner_wengle_tau(rhoB, ut_mag, def_nu, y);
+	const float slip_mag = fmax(ut_mag-tau_w*y/(fmax(rhoB, 1.0E-8f)*fmax(nu_eff, 1.0E-8f)), 0.0f);
+	return ut*(slip_mag/ut_mag);
+}
+)+R(float svbb_population(const float f_old, const uint reflected_i, const uint link_i, const float rhoB, const float3 uB, const float nu_eff) {
+	const float3 n_link = wall_link_normal(link_i);
+	const float3 ut = uB-dot(uB, n_link)*n_link;
+	const float ut_mag = length(ut);
+	if(ut_mag<=1.0E-8f) return f_old;
+	const float3 u_wall = svbb_wall_velocity(ut, ut_mag, rhoB, nu_eff, wall_link_distance(link_i));
+	const float3 c_wall = (float3)(c(link_i), c(def_velocity_set+link_i), c(2u*def_velocity_set+link_i));
+	const float delta = -6.0f*w(reflected_i)*rhoB*dot(c_wall, u_wall);
+	float f_new = f_old+delta;
+)+"#ifdef WALL_MODEL_POSITIVITY_CLAMP"+R(
+	const float f_min = -w(reflected_i)+1.0E-7f; // DDFs are stored shifted by equilibrium rest weight.
+	if(f_new<f_min&&delta<0.0f) f_new = f_old+delta*clamp((f_old-f_min)/(-delta), 0.0f, 1.0f);
+	f_new = fmax(f_new, f_min);
+)+"#endif"+R( // WALL_MODEL_POSITIVITY_CLAMP
+	return f_new;
+}
+)+R(void apply_svbb_wall_model(float* fhn, const uxx* j, const global uchar* flags, const float rhon, const float uxn, const float uyn, const float uzn, const float nu_eff) {
+	const float3 uB = (float3)(uxn, uyn, uzn);
+	for(uint i=1u; i<def_velocity_set; i+=2u) {
+		if((flags[j[i+1u]]&TYPE_BO)==TYPE_S) fhn[i   ] = svbb_population(fhn[i   ], i   , i+1u, rhon, uB, nu_eff);
+		if((flags[j[i   ]]&TYPE_BO)==TYPE_S) fhn[i+1u] = svbb_population(fhn[i+1u], i+1u, i   , rhon, uB, nu_eff);
+	}
+} // apply_svbb_wall_model()
+)+"#endif"+R( // WALL_MODEL_SVBB
 
 )+"#ifdef SURFACE"+R(
 )+R(void average_neighbors_non_gas(const uxx n, const global float* rho, const global float* u, const global uchar* flags, float* rhon, float* uxn, float* uyn, float* uzn) { // calculate average density and velocity of neighbors of cell n
@@ -1491,6 +1566,18 @@ string opencl_c_container() { return R( // ########################## begin of O
 		calculate_rho_u(fhn, &rhon, &uxn, &uyn, &uzn); // calculate density and velocity fields from fi
 	}
 )+"#endif"+R( // EQUILIBRIUM_BOUNDARIES
+
+)+"#ifdef WALL_MODEL_SVBB"+R(
+	if(flagsn_bo!=TYPE_E&&has_solid_neighbor(j, flags)) {
+		float feq_wall[def_velocity_set];
+		calculate_f_eq(rhon, uxn, uyn, uzn, feq_wall);
+		const float w_wall = calculate_relaxation_rate(fhn, feq_wall, rhon);
+		const float nu_eff_wall = fmax((1.0f/w_wall-0.5f)*0.33333334f, def_nu);
+		apply_svbb_wall_model(fhn, j, flags, rhon, uxn, uyn, uzn, nu_eff_wall);
+		calculate_rho_u(fhn, &rhon, &uxn, &uyn, &uzn);
+	}
+)+"#endif"+R( // WALL_MODEL_SVBB
+
 	float fxn=fx, fyn=fy, fzn=fz; // force starts as constant volume force, can be modified before call of calculate_forcing_terms(...)
 	float Fin[def_velocity_set]; // forcing terms
 
@@ -1574,23 +1661,7 @@ string opencl_c_container() { return R( // ########################## begin of O
 
 	float feq[def_velocity_set]; // equilibrium DDFs
 	calculate_f_eq(rhon, uxn, uyn, uzn, feq); // calculate equilibrium DDFs
-	float w = def_w; // LBM relaxation rate w = dt/tau = dt/(nu/c^2+dt/2) = 1/(3*nu+1/2)
-
-)+"#ifdef SUBGRID"+R(
-	{ // Smagorinsky-Lilly subgrid turbulence model, source: https://arxiv.org/pdf/comp-gas/9401004.pdf, in the eq. below (26), it is "tau_0" not "nu_0", and "sqrt(2)/rho" (they call "rho" "n") is missing
-		const float tau0 = 1.0f/w; // source 2: https://youtu.be/V8ydRrdCzl0
-		float Hxx=0.0f, Hyy=0.0f, Hzz=0.0f, Hxy=0.0f, Hxz=0.0f, Hyz=0.0f; // non-equilibrium stress tensor
-		for(uint i=1u; i<def_velocity_set; i++) {
-			const float fneqi = fhn[i]-feq[i];
-			const float cxi=c(i), cyi=c(def_velocity_set+i), czi=c(2u*def_velocity_set+i);
-			Hxx += cxi*cxi*fneqi; //Hyx += cyi*cxi*fneqi; Hzx += czi*cxi*fneqi; // symmetric tensor
-			Hxy += cxi*cyi*fneqi; Hyy += cyi*cyi*fneqi; //Hzy += czi*cyi*fneqi;
-			Hxz += cxi*czi*fneqi; Hyz += cyi*czi*fneqi; Hzz += czi*czi*fneqi;
-		}
-		const float Q = sq(Hxx)+sq(Hyy)+sq(Hzz)+2.0f*(sq(Hxy)+sq(Hxz)+sq(Hyz)); // Q = H*H, turbulent eddy viscosity nut = (C*Delta)^2*|S|, intensity of local strain rate tensor |S|=sqrt(2*S*S)
-		w = 2.0f/(tau0+sqrt(sq(tau0)+0.76421222f*sqrt(Q)/rhon)); // 0.76421222 = 18*sqrt(2)*(C*Delta)^2, C = 1/pi*(2/(3*CK))^(3/4) = Smagorinsky-Lilly constant, CK = 3/2 = Kolmogorov constant, Delta = 1 = lattice constant
-	} // modity LBM relaxation rate by increasing effective viscosity in regions of high strain rate (add turbulent eddy viscosity), nu_eff = nu_0+nu_t
-)+"#endif"+R( // SUBGRID
+	float w = calculate_relaxation_rate(fhn, feq, rhon); // LBM relaxation rate w = dt/tau, including SUBGRID if enabled
 
 )+"#if defined(SRT)"+R(
 )+"#ifdef VOLUME_FORCE"+R(

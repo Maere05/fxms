@@ -365,6 +365,7 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 
 	"\n	#define def_c 0.57735027f" // lattice speed of sound c = 1/sqrt(3)*dt
 	"\n	#define def_w " +to_string(1.0f/get_tau())+"f" // relaxation rate w = dt/tau = dt/(nu/c^2+dt/2) = 1/(3*nu+1/2)
+	"\n	#define def_nu "+to_string(get_nu())+"f" // molecular kinematic viscosity in LBM units
 #if defined(D2Q9)
 	"\n	#define def_w0 (1.0f/2.25f)" // center (0)
 	"\n	#define def_ws (1.0f/9.0f)" // straight (1-4)
@@ -458,7 +459,17 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 
 #ifdef SUBGRID
 	"\n	#define SUBGRID"
+	"\n	#define def_smagorinsky_C "+to_string(SUBGRID_SMAGORINSKY_C)+"f"
 #endif // SUBGRID
+
+#ifdef WALL_MODEL_SVBB
+	"\n	#define WALL_MODEL_SVBB"
+	"\n	#define def_wall_ww_A "+to_string(WALL_WERNER_WENGLE_A)+"f"
+	"\n	#define def_wall_ww_B "+to_string(WALL_WERNER_WENGLE_B)+"f"
+#ifdef WALL_MODEL_POSITIVITY_CLAMP
+	"\n	#define WALL_MODEL_POSITIVITY_CLAMP"
+#endif // WALL_MODEL_POSITIVITY_CLAMP
+#endif // WALL_MODEL_SVBB
 
 #ifdef PARTICLES
 	"\n	#define PARTICLES"
