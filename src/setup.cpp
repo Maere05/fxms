@@ -68,6 +68,12 @@ static string force_validation_csv_path(const string& name, const int memory_in_
 	return get_exe_path()+"export/force_validation/"+name+"_"+to_string(memory_in_mb)+"MB.csv";
 }
 
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+static string force_validation_wall_diag_csv_path(const string& name, const int memory_in_mb) {
+	return get_exe_path()+"export/force_validation/"+name+"_"+to_string(memory_in_mb)+"MB_wall_diag.csv";
+}
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
+
 static string csv_float(const float x) {
 	return to_string(x, 9u);
 }
@@ -107,6 +113,52 @@ static float wall_model_ww_B() {
 static void write_force_validation_header(const string& path) {
 	write_file(path, "case,memory_mb,Nx,Ny,Nz,step,time_s,Fx_N,Fy_drag_N,Fz_lift_N,Mx_Nm,My_Nm,Mz_Nm,Cd,Cl,Cs,Re,tau,nu_lbm,ref_area_m2,ref_length_m,wall_model,ww_A,ww_B\n");
 }
+
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+static void write_wall_diag_header(const string& path) {
+	write_file(path, "case,memory_mb,Nx,Ny,Nz,step,fluid_cells_checked,wall_adjacent_cells,solid_neighbor_links,links_touching_object,links_touching_plain_solid,ut_zero_links,slip_nonzero_links,slip_zero_reversal_clamp_links,positivity_clamp_links,population_delta_nonzero_links,avg_ut,avg_tau_w,avg_nu_eff,avg_raw_slip,avg_final_slip,avg_slip_ratio,avg_abs_population_delta,avg_signed_population_delta\n");
+}
+
+static float wall_diag_avg(const Wall_Diagnostics& d, const uint f_index) {
+	const float denom = (float)max(d.u[wall_diag_solid_neighbor_links], 1ull);
+	return d.f[f_index]/denom;
+}
+
+static void append_wall_diag_sample(const ForceValidationCase& c, const int memory_in_mb, LBM& lbm, const string& csv_path) {
+	const Wall_Diagnostics d = lbm.wall_diagnostics();
+	print_info("WALL_DIAG case="+c.name+
+		" memory_mb="+to_string(memory_in_mb)+
+		" step="+to_string(lbm.get_t())+
+		" wall_adjacent_cells="+to_string(d.u[wall_diag_wall_adjacent_cells])+
+		" solid_neighbor_links="+to_string(d.u[wall_diag_solid_neighbor_links])+
+		" links_touching_object="+to_string(d.u[wall_diag_links_touching_object])+
+		" links_touching_plain_solid="+to_string(d.u[wall_diag_links_touching_plain_solid])+
+		" slip_nonzero_links="+to_string(d.u[wall_diag_slip_nonzero_links])+
+		" slip_zero_reversal_clamp_links="+to_string(d.u[wall_diag_slip_zero_reversal_clamp_links])+
+		" positivity_clamp_links="+to_string(d.u[wall_diag_positivity_clamp_links])+
+		" avg_final_slip="+csv_float(wall_diag_avg(d, wall_diag_sum_final_slip)));
+	write_line(csv_path, c.name+","+to_string(memory_in_mb)+","+csv_uint3(uint3(lbm.get_Nx(), lbm.get_Ny(), lbm.get_Nz()))+","+
+		to_string(lbm.get_t())+","+
+		to_string(d.u[wall_diag_fluid_cells_checked])+","+
+		to_string(d.u[wall_diag_wall_adjacent_cells])+","+
+		to_string(d.u[wall_diag_solid_neighbor_links])+","+
+		to_string(d.u[wall_diag_links_touching_object])+","+
+		to_string(d.u[wall_diag_links_touching_plain_solid])+","+
+		to_string(d.u[wall_diag_ut_zero_links])+","+
+		to_string(d.u[wall_diag_slip_nonzero_links])+","+
+		to_string(d.u[wall_diag_slip_zero_reversal_clamp_links])+","+
+		to_string(d.u[wall_diag_positivity_clamp_links])+","+
+		to_string(d.u[wall_diag_population_delta_nonzero_links])+","+
+		csv_float(wall_diag_avg(d, wall_diag_sum_ut_mag))+","+
+		csv_float(wall_diag_avg(d, wall_diag_sum_tau_w))+","+
+		csv_float(wall_diag_avg(d, wall_diag_sum_nu_eff))+","+
+		csv_float(wall_diag_avg(d, wall_diag_sum_raw_slip))+","+
+		csv_float(wall_diag_avg(d, wall_diag_sum_final_slip))+","+
+		csv_float(wall_diag_avg(d, wall_diag_sum_slip_ratio))+","+
+		csv_float(wall_diag_avg(d, wall_diag_sum_abs_population_delta))+","+
+		csv_float(wall_diag_avg(d, wall_diag_sum_signed_population_delta)));
+}
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
 
 static float3 mesh_size(const Mesh* mesh) {
 	return mesh->pmax-mesh->pmin;
@@ -233,11 +285,22 @@ static void run_force_validation_case(const ForceValidationCase& c, const int me
 #endif // GRAPHICS
 	const string csv_path = force_validation_csv_path(c.name, memory_in_mb);
 	write_force_validation_header(csv_path);
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+	const bool write_wall_diag = c.name=="ahmed";
+	const string wall_diag_csv_path = force_validation_wall_diag_csv_path(c.name, memory_in_mb);
+	if(write_wall_diag) write_wall_diag_header(wall_diag_csv_path);
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
 	lbm.run(force_validation_config.init_steps);
 	const float3 torque_center = lbm.object_center_of_mass(TYPE_S|TYPE_X);
 	for(uint i=0u; i<force_validation_config.sample_count; i++) {
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+		if(write_wall_diag) lbm.reset_wall_diagnostics();
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
 		lbm.run(force_validation_config.sample_interval);
 		append_force_sample(c, memory_in_mb, lbm, torque_center, csv_path);
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+		if(write_wall_diag) append_wall_diag_sample(c, memory_in_mb, lbm, wall_diag_csv_path);
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
 	}
 	print_info("FORCE_VALIDATION_END case="+c.name+" memory_mb="+to_string(memory_in_mb)+" csv="+csv_path);
 }

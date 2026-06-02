@@ -27,6 +27,7 @@
 #define WALL_WERNER_WENGLE_A 8.3f // Werner-Wengle wall-law constant A
 #define WALL_WERNER_WENGLE_B (1.0f/7.0f) // Werner-Wengle wall-law constant B
 #define WALL_MODEL_POSITIVITY_CLAMP // limits wall-model slip correction so shifted DDFs remain physically admissible
+//#define WALL_MODEL_DIAGNOSTICS // records tiny global diagnostics for WALL_MODEL_SVBB wall-link corrections
 //#define PARTICLES // enables particles with immersed-boundary method (for 2-way coupling also activate VOLUME_FORCE and FORCE_FIELD; only supported in single-GPU)
 
 //#define INTERACTIVE_GRAPHICS // enable interactive graphics; start/pause the simulation by pressing P; either Windows or Linux X11 desktop must be available; on Linux: change to "compile on Linux with X11" command in make.sh
@@ -91,6 +92,7 @@
 #undef SUBGRID_SMAGORINSKY_C
 #undef WALL_MODEL_SVBB
 #undef WALL_MODEL_POSITIVITY_CLAMP
+#undef WALL_MODEL_DIAGNOSTICS
 #undef PARTICLES
 #undef INTERACTIVE_GRAPHICS
 #undef INTERACTIVE_GRAPHICS_ASCII

@@ -14,6 +14,42 @@ uint3 resolution(const float3 box_aspect_ratio, const uint memory); // input: si
 string default_filename(const string& path, const string& name, const string& extension, const ulong t); // generate a default filename with timestamp
 string default_filename(const string& name, const string& extension, const ulong t); // generate a default filename with timestamp at exe_path/export/
 
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+enum enum_wall_diag_u {
+	wall_diag_fluid_cells_checked,
+	wall_diag_wall_adjacent_cells,
+	wall_diag_solid_neighbor_links,
+	wall_diag_links_touching_object,
+	wall_diag_links_touching_plain_solid,
+	wall_diag_ut_zero_links,
+	wall_diag_slip_nonzero_links,
+	wall_diag_slip_zero_reversal_clamp_links,
+	wall_diag_positivity_clamp_links,
+	wall_diag_population_delta_nonzero_links,
+	wall_diag_u_count
+};
+enum enum_wall_diag_f {
+	wall_diag_sum_ut_mag,
+	wall_diag_sum_tau_w,
+	wall_diag_sum_nu_eff,
+	wall_diag_sum_raw_slip,
+	wall_diag_sum_final_slip,
+	wall_diag_sum_slip_ratio,
+	wall_diag_sum_abs_population_delta,
+	wall_diag_sum_signed_population_delta,
+	wall_diag_f_count
+};
+struct Wall_Diagnostics {
+	ulong u[wall_diag_u_count];
+	float f[wall_diag_f_count];
+	inline Wall_Diagnostics() { reset(); }
+	inline void reset() {
+		for(uint i=0u; i<wall_diag_u_count; i++) u[i] = 0ull;
+		for(uint i=0u; i<wall_diag_f_count; i++) f[i] = 0.0f;
+	}
+};
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
+
 #pragma warning(disable:26812)
 enum enum_transfer_field { fi, rho_u_flags, flags, F, phi_massex_flags, gi, T, enum_transfer_field_length };
 
@@ -62,6 +98,10 @@ private:
 #ifdef PARTICLES
 	Kernel kernel_integrate_particles; // intgegrates particles forward in time and couples particles to fluid
 #endif // PARTICLES
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+	Memory<uint> wall_diag_u; // high/low uint pairs for global wall-model diagnostic counters
+	Memory<float> wall_diag_f; // global wall-model diagnostic float accumulators
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
 
 	void allocate(Device& device); // allocate all memory for data fields on host and device and set up kernels
 	string device_defines(const Device_Info& device_info) const; // returns preprocessor constants for embedding in OpenCL C code
@@ -114,6 +154,10 @@ public:
 #ifdef PARTICLES
 	void enqueue_integrate_particles(const uint time_step_multiplicator=1u); // intgegrates particles forward in time and couples particles to fluid
 #endif // PARTICLES
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+	void reset_wall_diagnostics();
+	void add_wall_diagnostics(Wall_Diagnostics& diagnostics);
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
 
 	void increment_time_step(const ulong steps=1ull); // increment time step
 	void reset_time_step(); // reset time step
@@ -450,6 +494,10 @@ public:
 #if defined(PARTICLES)&&!defined(FORCE_FIELD)
 	void integrate_particles(const ulong steps=max_ulong, const ulong total_steps=max_ulong, const uint time_step_multiplicator=1u); // intgegrate passive tracer particles forward in time in stationary flow field
 #endif // PARTICLES&&!FORCE_FIELD
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+	void reset_wall_diagnostics();
+	Wall_Diagnostics wall_diagnostics();
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
 
 	uint get_Nx() const { return Nx; } // get (global) lattice dimensions in x-direction
 	uint get_Ny() const { return Ny; } // get (global) lattice dimensions in y-direction

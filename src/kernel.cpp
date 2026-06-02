@@ -1133,6 +1133,16 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#endif"+R( // MOVING_BOUNDARIES
 
 )+"#ifdef WALL_MODEL_SVBB"+R(
+)+"#ifdef WALL_MODEL_DIAGNOSTICS"+R(
+)+R(void wall_diag_add_u(volatile global uint* wall_diag_u, const uint i) {
+	const uint lo = 2u*i;
+	const uint old = atomic_add(&wall_diag_u[lo], 1u);
+	if(old==0xFFFFFFFFu) atomic_inc(&wall_diag_u[lo+1u]);
+}
+)+R(void wall_diag_add_f(volatile global float* addr, const float val) {
+	float old = val; while((old=atomic_xchg(addr, atomic_xchg(addr, 0.0f)+old))!=0.0f);
+}
+)+"#endif"+R( // WALL_MODEL_DIAGNOSTICS
 )+R(bool has_solid_neighbor(const uxx* j, const global uchar* flags) {
 	bool next_to_solid = false;
 	for(uint i=1u; i<def_velocity_set; i++) next_to_solid = next_to_solid||((flags[j[i]]&TYPE_BO)==TYPE_S);
@@ -1162,12 +1172,67 @@ string opencl_c_container() { return R( // ########################## begin of O
 	const float slip_mag = fmax(ut_mag-tau_w*y/(fmax(rhoB, 1.0E-8f)*fmax(nu_eff, 1.0E-8f)), 0.0f);
 	return ut*(slip_mag/ut_mag);
 }
+)+"#ifdef WALL_MODEL_DIAGNOSTICS"+R(
+)+R(float svbb_population(const float f_old, const uint reflected_i, const uint link_i, const uchar neighbor_flags, const float rhoB, const float3 uB, const float nu_eff, volatile global uint* wall_diag_u, volatile global float* wall_diag_f) {
+	wall_diag_add_u(wall_diag_u, WALL_DIAG_SOLID_NEIGHBOR_LINKS);
+	if(neighbor_flags==(TYPE_S|TYPE_X)) wall_diag_add_u(wall_diag_u, WALL_DIAG_LINKS_TOUCHING_OBJECT);
+	if(neighbor_flags==TYPE_S) wall_diag_add_u(wall_diag_u, WALL_DIAG_LINKS_TOUCHING_PLAIN_SOLID);
+	const float3 n_link = wall_link_normal(link_i);
+	const float3 ut = uB-dot(uB, n_link)*n_link;
+	const float ut_mag = length(ut);
+	if(ut_mag<=1.0E-8f) {
+		wall_diag_add_u(wall_diag_u, WALL_DIAG_UT_ZERO_LINKS);
+		return f_old;
+	}
+	const float y = wall_link_distance(link_i);
+	const float tau_w = werner_wengle_tau(rhoB, ut_mag, def_nu, y);
+	const float raw_slip = ut_mag-tau_w*y/(fmax(rhoB, 1.0E-8f)*fmax(nu_eff, 1.0E-8f));
+	const float slip_mag = fmax(raw_slip, 0.0f);
+	const float3 u_wall = ut*(slip_mag/ut_mag);
+	wall_diag_add_f(&wall_diag_f[WALL_DIAG_SUM_UT_MAG], ut_mag);
+	wall_diag_add_f(&wall_diag_f[WALL_DIAG_SUM_TAU_W], tau_w);
+	wall_diag_add_f(&wall_diag_f[WALL_DIAG_SUM_NU_EFF], nu_eff);
+	wall_diag_add_f(&wall_diag_f[WALL_DIAG_SUM_RAW_SLIP], raw_slip);
+	wall_diag_add_f(&wall_diag_f[WALL_DIAG_SUM_FINAL_SLIP], slip_mag);
+	wall_diag_add_f(&wall_diag_f[WALL_DIAG_SUM_SLIP_RATIO], slip_mag/ut_mag);
+	if(slip_mag>1.0E-8f) wall_diag_add_u(wall_diag_u, WALL_DIAG_SLIP_NONZERO_LINKS);
+	if(raw_slip<0.0f) wall_diag_add_u(wall_diag_u, WALL_DIAG_SLIP_ZERO_REVERSAL_CLAMP_LINKS);
+	const float3 c_wall = (float3)(c(link_i), c(def_velocity_set+link_i), c(2u*def_velocity_set+link_i));
+	const float delta = -6.0f*w(reflected_i)*rhoB*dot(c_wall, u_wall);
+	float f_new = f_old+delta;
+)+"#ifdef WALL_MODEL_POSITIVITY_CLAMP"+R(
+	const float f_min = -w(reflected_i)+1.0E-7f; // DDFs are stored shifted by equilibrium rest weight.
+	if(f_new<f_min&&delta<0.0f) {
+		wall_diag_add_u(wall_diag_u, WALL_DIAG_POSITIVITY_CLAMP_LINKS);
+		f_new = f_old+delta*clamp((f_old-f_min)/(-delta), 0.0f, 1.0f);
+	}
+	f_new = fmax(f_new, f_min);
+)+"#endif"+R( // WALL_MODEL_POSITIVITY_CLAMP
+	const float final_delta = f_new-f_old;
+	wall_diag_add_f(&wall_diag_f[WALL_DIAG_SUM_ABS_POPULATION_DELTA], fabs(final_delta));
+	wall_diag_add_f(&wall_diag_f[WALL_DIAG_SUM_SIGNED_POPULATION_DELTA], final_delta);
+	if(fabs(final_delta)>1.0E-12f) wall_diag_add_u(wall_diag_u, WALL_DIAG_POPULATION_DELTA_NONZERO_LINKS);
+	return f_new;
+}
+)+R(void apply_svbb_wall_model(float* fhn, const uxx* j, const global uchar* flags, const float rhon, const float uxn, const float uyn, const float uzn, const float nu_eff, volatile global uint* wall_diag_u, volatile global float* wall_diag_f) {
+	const float3 uB = (float3)(uxn, uyn, uzn);
+	for(uint i=1u; i<def_velocity_set; i+=2u) {
+		const uchar flags_jip = flags[j[i+1u]];
+		const uchar flags_jim = flags[j[i   ]];
+		if((flags_jip&TYPE_BO)==TYPE_S) fhn[i   ] = svbb_population(fhn[i   ], i   , i+1u, flags_jip, rhon, uB, nu_eff, wall_diag_u, wall_diag_f);
+		if((flags_jim&TYPE_BO)==TYPE_S) fhn[i+1u] = svbb_population(fhn[i+1u], i+1u, i   , flags_jim, rhon, uB, nu_eff, wall_diag_u, wall_diag_f);
+	}
+} // apply_svbb_wall_model()
+)+"#else"+R(
 )+R(float svbb_population(const float f_old, const uint reflected_i, const uint link_i, const float rhoB, const float3 uB, const float nu_eff) {
 	const float3 n_link = wall_link_normal(link_i);
 	const float3 ut = uB-dot(uB, n_link)*n_link;
 	const float ut_mag = length(ut);
 	if(ut_mag<=1.0E-8f) return f_old;
-	const float3 u_wall = svbb_wall_velocity(ut, ut_mag, rhoB, nu_eff, wall_link_distance(link_i));
+	const float y = wall_link_distance(link_i);
+	const float tau_w = werner_wengle_tau(rhoB, ut_mag, def_nu, y);
+	const float slip_mag = fmax(ut_mag-tau_w*y/(fmax(rhoB, 1.0E-8f)*fmax(nu_eff, 1.0E-8f)), 0.0f);
+	const float3 u_wall = ut*(slip_mag/ut_mag);
 	const float3 c_wall = (float3)(c(link_i), c(def_velocity_set+link_i), c(2u*def_velocity_set+link_i));
 	const float delta = -6.0f*w(reflected_i)*rhoB*dot(c_wall, u_wall);
 	float f_new = f_old+delta;
@@ -1181,10 +1246,13 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+R(void apply_svbb_wall_model(float* fhn, const uxx* j, const global uchar* flags, const float rhon, const float uxn, const float uyn, const float uzn, const float nu_eff) {
 	const float3 uB = (float3)(uxn, uyn, uzn);
 	for(uint i=1u; i<def_velocity_set; i+=2u) {
-		if((flags[j[i+1u]]&TYPE_BO)==TYPE_S) fhn[i   ] = svbb_population(fhn[i   ], i   , i+1u, rhon, uB, nu_eff);
-		if((flags[j[i   ]]&TYPE_BO)==TYPE_S) fhn[i+1u] = svbb_population(fhn[i+1u], i+1u, i   , rhon, uB, nu_eff);
+		const uchar flags_jip = flags[j[i+1u]];
+		const uchar flags_jim = flags[j[i   ]];
+		if((flags_jip&TYPE_BO)==TYPE_S) fhn[i   ] = svbb_population(fhn[i   ], i   , i+1u, rhon, uB, nu_eff);
+		if((flags_jim&TYPE_BO)==TYPE_S) fhn[i+1u] = svbb_population(fhn[i+1u], i+1u, i   , rhon, uB, nu_eff);
 	}
 } // apply_svbb_wall_model()
+)+"#endif"+R( // WALL_MODEL_DIAGNOSTICS
 )+"#endif"+R( // WALL_MODEL_SVBB
 
 )+"#ifdef SURFACE"+R(
@@ -1530,6 +1598,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 )+"#ifdef FORCE_FIELD"+R(
 	, const global float* F // argument order is important
 )+"#endif"+R( // FORCE_FIELD
+)+"#ifdef WALL_MODEL_DIAGNOSTICS"+R(
+	, volatile global uint* wall_diag_u, volatile global float* wall_diag_f // argument order is important
+)+"#endif"+R( // WALL_MODEL_DIAGNOSTICS
 )+"#ifdef SURFACE"+R(
 	, const global float* mass // argument order is important
 )+"#endif"+R( // SURFACE
@@ -1569,11 +1640,19 @@ string opencl_c_container() { return R( // ########################## begin of O
 
 )+"#ifdef WALL_MODEL_SVBB"+R(
 	if(flagsn_bo!=TYPE_E&&has_solid_neighbor(j, flags)) {
+)+"#ifdef WALL_MODEL_DIAGNOSTICS"+R(
+		wall_diag_add_u(wall_diag_u, WALL_DIAG_FLUID_CELLS_CHECKED);
+		wall_diag_add_u(wall_diag_u, WALL_DIAG_WALL_ADJACENT_CELLS);
+)+"#endif"+R( // WALL_MODEL_DIAGNOSTICS
 		float feq_wall[def_velocity_set];
 		calculate_f_eq(rhon, uxn, uyn, uzn, feq_wall);
 		const float w_wall = calculate_relaxation_rate(fhn, feq_wall, rhon);
 		const float nu_eff_wall = fmax((1.0f/w_wall-0.5f)*0.33333334f, def_nu);
+)+"#ifdef WALL_MODEL_DIAGNOSTICS"+R(
+		apply_svbb_wall_model(fhn, j, flags, rhon, uxn, uyn, uzn, nu_eff_wall, wall_diag_u, wall_diag_f);
+)+"#else"+R(
 		apply_svbb_wall_model(fhn, j, flags, rhon, uxn, uyn, uzn, nu_eff_wall);
+)+"#endif"+R( // WALL_MODEL_DIAGNOSTICS
 		calculate_rho_u(fhn, &rhon, &uxn, &uyn, &uzn);
 	}
 )+"#endif"+R( // WALL_MODEL_SVBB

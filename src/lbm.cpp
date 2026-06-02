@@ -140,6 +140,12 @@ void LBM_Domain::allocate(Device& device) {
 	kernel_object_torque = Kernel(device, N, "object_torque", F, flags, (uchar)0u, 0.0f, 0.0f, 0.0f, object_sum);
 #endif // FORCE_FIELD
 
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+	wall_diag_u = Memory<uint>(device, 1u, 2u*(uint)wall_diag_u_count);
+	wall_diag_f = Memory<float>(device, 1u, (uint)wall_diag_f_count);
+	kernel_stream_collide.add_parameters(wall_diag_u, wall_diag_f);
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
+
 #ifdef MOVING_BOUNDARIES
 	kernel_update_moving_boundaries = Kernel(device, N, "update_moving_boundaries", u, flags);
 #endif // MOVING_BOUNDARIES
@@ -251,6 +257,19 @@ void LBM_Domain::enqueue_integrate_particles(const uint time_step_multiplicator)
 	kernel_integrate_particles.set_parameters(3u, (float)time_step_multiplicator).enqueue_run();
 }
 #endif // PARTICLES
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+void LBM_Domain::reset_wall_diagnostics() {
+	wall_diag_u.reset(0u);
+	wall_diag_f.reset(0.0f);
+}
+void LBM_Domain::add_wall_diagnostics(Wall_Diagnostics& diagnostics) {
+	wall_diag_u.enqueue_read_from_device();
+	wall_diag_f.enqueue_read_from_device();
+	finish_queue();
+	for(uint i=0u; i<(uint)wall_diag_u_count; i++) diagnostics.u[i] += ((ulong)wall_diag_u[2u*i])|(((ulong)wall_diag_u[2u*i+1u])<<32u);
+	for(uint i=0u; i<(uint)wall_diag_f_count; i++) diagnostics.f[i] += wall_diag_f[i];
+}
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
 
 void LBM_Domain::increment_time_step(const ulong steps) {
 	t += steps; // increment time step
@@ -469,6 +488,27 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 #ifdef WALL_MODEL_POSITIVITY_CLAMP
 	"\n	#define WALL_MODEL_POSITIVITY_CLAMP"
 #endif // WALL_MODEL_POSITIVITY_CLAMP
+#ifdef WALL_MODEL_DIAGNOSTICS
+	"\n	#define WALL_MODEL_DIAGNOSTICS"
+	"\n	#define WALL_DIAG_FLUID_CELLS_CHECKED "+to_string((uint)wall_diag_fluid_cells_checked)+"u"
+	"\n	#define WALL_DIAG_WALL_ADJACENT_CELLS "+to_string((uint)wall_diag_wall_adjacent_cells)+"u"
+	"\n	#define WALL_DIAG_SOLID_NEIGHBOR_LINKS "+to_string((uint)wall_diag_solid_neighbor_links)+"u"
+	"\n	#define WALL_DIAG_LINKS_TOUCHING_OBJECT "+to_string((uint)wall_diag_links_touching_object)+"u"
+	"\n	#define WALL_DIAG_LINKS_TOUCHING_PLAIN_SOLID "+to_string((uint)wall_diag_links_touching_plain_solid)+"u"
+	"\n	#define WALL_DIAG_UT_ZERO_LINKS "+to_string((uint)wall_diag_ut_zero_links)+"u"
+	"\n	#define WALL_DIAG_SLIP_NONZERO_LINKS "+to_string((uint)wall_diag_slip_nonzero_links)+"u"
+	"\n	#define WALL_DIAG_SLIP_ZERO_REVERSAL_CLAMP_LINKS "+to_string((uint)wall_diag_slip_zero_reversal_clamp_links)+"u"
+	"\n	#define WALL_DIAG_POSITIVITY_CLAMP_LINKS "+to_string((uint)wall_diag_positivity_clamp_links)+"u"
+	"\n	#define WALL_DIAG_POPULATION_DELTA_NONZERO_LINKS "+to_string((uint)wall_diag_population_delta_nonzero_links)+"u"
+	"\n	#define WALL_DIAG_SUM_UT_MAG "+to_string((uint)wall_diag_sum_ut_mag)+"u"
+	"\n	#define WALL_DIAG_SUM_TAU_W "+to_string((uint)wall_diag_sum_tau_w)+"u"
+	"\n	#define WALL_DIAG_SUM_NU_EFF "+to_string((uint)wall_diag_sum_nu_eff)+"u"
+	"\n	#define WALL_DIAG_SUM_RAW_SLIP "+to_string((uint)wall_diag_sum_raw_slip)+"u"
+	"\n	#define WALL_DIAG_SUM_FINAL_SLIP "+to_string((uint)wall_diag_sum_final_slip)+"u"
+	"\n	#define WALL_DIAG_SUM_SLIP_RATIO "+to_string((uint)wall_diag_sum_slip_ratio)+"u"
+	"\n	#define WALL_DIAG_SUM_ABS_POPULATION_DELTA "+to_string((uint)wall_diag_sum_abs_population_delta)+"u"
+	"\n	#define WALL_DIAG_SUM_SIGNED_POPULATION_DELTA "+to_string((uint)wall_diag_sum_signed_population_delta)+"u"
+#endif // WALL_MODEL_DIAGNOSTICS
 #endif // WALL_MODEL_SVBB
 
 #ifdef PARTICLES
@@ -1025,6 +1065,18 @@ float3 LBM::object_torque(const float3& rotation_center, const uchar flag_marker
 	return object_torque;
 }
 #endif // FORCE_FIELD
+
+#if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
+void LBM::reset_wall_diagnostics() {
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->reset_wall_diagnostics();
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+}
+Wall_Diagnostics LBM::wall_diagnostics() {
+	Wall_Diagnostics diagnostics;
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->add_wall_diagnostics(diagnostics);
+	return diagnostics;
+}
+#endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
 
 #ifdef MOVING_BOUNDARIES
 void LBM::update_moving_boundaries() { // mark/unmark cells next to TYPE_S cells with velocity!=0 with TYPE_MS
