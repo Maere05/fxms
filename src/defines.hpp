@@ -26,7 +26,12 @@
 #define WALL_MODEL_SVBB // enables slip-velocity bounce-back wall modeling for under-resolved turbulent solid boundaries
 #define WALL_WERNER_WENGLE_A 8.3f // Werner-Wengle wall-law constant A
 #define WALL_WERNER_WENGLE_B (1.0f/7.0f) // Werner-Wengle wall-law constant B
+#define WALL_MODEL_SVBB_NU_CAP 32.0f // limits slip inversion viscosity to at most this multiple of molecular viscosity
+#define WALL_MODEL_SVBB_DELTA_SIGN -1.0f // sign for moving-wall population correction
+//#define WALL_MODEL_SVBB_FORCE_CORRECTION // applies the moving-wall MEM correction term in update_force_field()
 #define WALL_MODEL_POSITIVITY_CLAMP // limits wall-model slip correction so shifted DDFs remain physically admissible
+//#define WALL_MODEL_SVBB_OBJECT_ONLY // experimental: apply SVBB only to TYPE_S|TYPE_X object links
+//#define WALL_MODEL_SVBB_FLOOR_ONLY // experimental: apply SVBB only to plain TYPE_S links
 //#define WALL_MODEL_DIAGNOSTICS // records tiny global diagnostics for WALL_MODEL_SVBB wall-link corrections
 //#define PARTICLES // enables particles with immersed-boundary method (for 2-way coupling also activate VOLUME_FORCE and FORCE_FIELD; only supported in single-GPU)
 
@@ -51,6 +56,10 @@
 #define GRAPHICS_LSP 4u // local box size for local memory optimization in graphics_rasterize_phi() kernel, possible values: 0u (disable local memory optimization), 4u (default, ~40% speedup), 8u (~40% speedup)
 
 //#define GRAPHICS_TRANSPARENCY 0.7f // optional: comment/uncomment this line to disable/enable semi-transparent rendering (looks better but reduces framerate), number represents transparency (equal to 1-opacity) (default: 0.7f)
+
+#if defined(WALL_MODEL_SVBB_OBJECT_ONLY) && defined(WALL_MODEL_SVBB_FLOOR_ONLY)
+#error WALL_MODEL_SVBB_OBJECT_ONLY and WALL_MODEL_SVBB_FLOOR_ONLY are mutually exclusive.
+#endif // WALL_MODEL_SVBB_OBJECT_ONLY && WALL_MODEL_SVBB_FLOOR_ONLY
 
 
 
@@ -91,7 +100,12 @@
 #undef SUBGRID
 #undef SUBGRID_SMAGORINSKY_C
 #undef WALL_MODEL_SVBB
+#undef WALL_MODEL_SVBB_NU_CAP
+#undef WALL_MODEL_SVBB_DELTA_SIGN
+#undef WALL_MODEL_SVBB_FORCE_CORRECTION
 #undef WALL_MODEL_POSITIVITY_CLAMP
+#undef WALL_MODEL_SVBB_OBJECT_ONLY
+#undef WALL_MODEL_SVBB_FLOOR_ONLY
 #undef WALL_MODEL_DIAGNOSTICS
 #undef PARTICLES
 #undef INTERACTIVE_GRAPHICS

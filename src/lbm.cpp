@@ -485,9 +485,20 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 	"\n	#define WALL_MODEL_SVBB"
 	"\n	#define def_wall_ww_A "+to_string(WALL_WERNER_WENGLE_A)+"f"
 	"\n	#define def_wall_ww_B "+to_string(WALL_WERNER_WENGLE_B)+"f"
+	"\n	#define def_wall_svbb_nu_cap "+to_string(WALL_MODEL_SVBB_NU_CAP)+"f"
+	"\n	#define def_wall_svbb_delta_sign "+to_string(WALL_MODEL_SVBB_DELTA_SIGN)+"f"
 #ifdef WALL_MODEL_POSITIVITY_CLAMP
 	"\n	#define WALL_MODEL_POSITIVITY_CLAMP"
 #endif // WALL_MODEL_POSITIVITY_CLAMP
+#ifdef WALL_MODEL_SVBB_OBJECT_ONLY
+	"\n	#define WALL_MODEL_SVBB_OBJECT_ONLY"
+#endif // WALL_MODEL_SVBB_OBJECT_ONLY
+#ifdef WALL_MODEL_SVBB_FLOOR_ONLY
+	"\n	#define WALL_MODEL_SVBB_FLOOR_ONLY"
+#endif // WALL_MODEL_SVBB_FLOOR_ONLY
+#ifdef WALL_MODEL_SVBB_FORCE_CORRECTION
+	"\n	#define WALL_MODEL_SVBB_FORCE_CORRECTION"
+#endif // WALL_MODEL_SVBB_FORCE_CORRECTION
 #ifdef WALL_MODEL_DIAGNOSTICS
 	"\n	#define WALL_MODEL_DIAGNOSTICS"
 	"\n	#define WALL_DIAG_FLUID_CELLS_CHECKED "+to_string((uint)wall_diag_fluid_cells_checked)+"u"
