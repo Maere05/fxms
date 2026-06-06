@@ -42,11 +42,15 @@ struct ForceValidationConfig {
 	float si_nu = 1.48E-5f;
 	float lbm_u = 0.1f;
 	ulong init_steps = 2000ull;
+	ulong sample_steps = 0ull;
 	uint sample_count = 20u;
 	ulong sample_interval = 50ull;
 	ulong ahmed_init_convective_times = 15ull;
 	ulong ahmed_sample_convective_times = 30ull;
 	ulong ahmed_sample_interval = 10ull;
+	bool init_steps_override = false;
+	bool sample_steps_override = false;
+	bool sample_interval_override = false;
 };
 
 struct ForceValidationCase {
@@ -114,7 +118,7 @@ struct ForceValidationRunningStats {
 	vector<float3> force_by_link_sum;
 };
 
-static const ForceValidationConfig force_validation_config;
+static ForceValidationConfig force_validation_config;
 static uint3 force_validation_domains = uint3(1u);
 static bool force_validation_domains_explicit = false;
 static const float NACA_AOA_DEG = 0.0f;
@@ -380,9 +384,9 @@ static ForceValidationSchedule force_validation_schedule(const ForceValidationCa
 	if(c.name=="ahmed") {
 		const float Tc = c.si_ref_length/c.si_u;
 		s.steps_per_Tc = max(units.t(Tc), 1ull);
-		s.init_steps = max(force_validation_config.init_steps, force_validation_config.ahmed_init_convective_times*s.steps_per_Tc);
-		s.sample_steps = force_validation_config.ahmed_sample_convective_times*s.steps_per_Tc;
-		s.sample_interval = max(force_validation_config.ahmed_sample_interval, 1ull);
+		s.init_steps = force_validation_config.init_steps_override ? force_validation_config.init_steps : max(force_validation_config.init_steps, force_validation_config.ahmed_init_convective_times*s.steps_per_Tc);
+		s.sample_steps = force_validation_config.sample_steps_override ? force_validation_config.sample_steps : force_validation_config.ahmed_sample_convective_times*s.steps_per_Tc;
+		s.sample_interval = force_validation_config.sample_interval_override ? force_validation_config.sample_interval : max(force_validation_config.ahmed_sample_interval, 1ull);
 		s.sample_count = (uint)min((s.sample_steps+s.sample_interval-1ull)/s.sample_interval, (ulong)max_uint);
 	} else {
 		s.steps_per_Tc = c.si_u>0.0f ? max(units.t(c.si_ref_length/c.si_u), 1ull) : 0ull;
@@ -675,7 +679,7 @@ void sim_skijumper(int memory_in_mb) {
 }
 
 static void print_force_validation_usage() {
-	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [--smagorinsky C] [--domains Dx,Dy,Dz] [gpu_id ...]");
+	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [--smagorinsky C] [--domains Dx,Dy,Dz] [--init-steps N] [--sample-steps N] [--sample-interval N] [gpu_id ...]");
 	print_info("Defaults: ahmed 2000 0");
 }
 
@@ -723,11 +727,32 @@ void main_setup() {
 		} else if(begins_with(arg, "--domains=")) {
 			force_validation_domains = parse_force_validation_domains(substring(main_arguments[i], 10u));
 			force_validation_domains_explicit = true;
+		} else if(arg=="--init-steps"&&i+1u<(uint)main_arguments.size()) {
+			force_validation_config.init_steps = to_ulong(main_arguments[++i]);
+			force_validation_config.init_steps_override = true;
+		} else if(begins_with(arg, "--init-steps=")) {
+			force_validation_config.init_steps = to_ulong(substring(main_arguments[i], 13u));
+			force_validation_config.init_steps_override = true;
+		} else if(arg=="--sample-steps"&&i+1u<(uint)main_arguments.size()) {
+			force_validation_config.sample_steps = to_ulong(main_arguments[++i]);
+			force_validation_config.sample_steps_override = true;
+		} else if(begins_with(arg, "--sample-steps=")) {
+			force_validation_config.sample_steps = to_ulong(substring(main_arguments[i], 15u));
+			force_validation_config.sample_steps_override = true;
+		} else if(arg=="--sample-interval"&&i+1u<(uint)main_arguments.size()) {
+			force_validation_config.sample_interval = to_ulong(main_arguments[++i]);
+			force_validation_config.sample_interval_override = true;
+		} else if(begins_with(arg, "--sample-interval=")) {
+			force_validation_config.sample_interval = to_ulong(substring(main_arguments[i], 18u));
+			force_validation_config.sample_interval_override = true;
 		} else {
 			gpu_arguments.push_back(main_arguments[i]);
 		}
 	}
 	if(lbm_smagorinsky_C<0.0f) print_error("Smagorinsky constant must be non-negative.");
+	if(force_validation_config.init_steps_override&&force_validation_config.init_steps==0ull) print_error("Force-validation init steps must be greater than zero.");
+	if(force_validation_config.sample_steps_override&&force_validation_config.sample_steps==0ull) print_error("Force-validation sample steps must be greater than zero.");
+	if(force_validation_config.sample_interval_override&&force_validation_config.sample_interval==0ull) print_error("Force-validation sample interval must be greater than zero.");
 	if(gpu_arguments.size()==0u) gpu_arguments.push_back("0");
 	if(!force_validation_domains_explicit&&gpu_arguments.size()>1u) force_validation_domains = uint3(1u, (uint)gpu_arguments.size(), 1u);
 	if(force_validation_domains.x*force_validation_domains.y*force_validation_domains.z!=(uint)gpu_arguments.size()) print_error("Number of GPU IDs must match force-validation domains.");
