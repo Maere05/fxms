@@ -3,6 +3,7 @@
 
 
 Units units; // for unit conversion
+float lbm_smagorinsky_C = SUBGRID_SMAGORINSKY_C;
 
 #if defined(D2Q9)
 const uint velocity_set = 9u;
@@ -131,12 +132,14 @@ void LBM_Domain::allocate(Device& device) {
 #ifdef FORCE_FIELD
 	F = Memory<float>(device, N, 3u);
 	object_sum = Memory<float>(device, 1u, 4u); // x, y, z, cell count
+	object_force_links = Memory<float>(device, 1u, 3u*velocity_set); // per-link x/y/z force bins
 	kernel_stream_collide.add_parameters(F);
 	kernel_update_fields.add_parameters(F);
 	kernel_update_force_field = Kernel(device, N, "update_force_field", fi, flags, t, F);
 	kernel_reset_force_field = Kernel(device, N, "reset_force_field", F);
 	kernel_object_center_of_mass = Kernel(device, N, "object_center_of_mass", flags, (uchar)0u, object_sum);
 	kernel_object_force = Kernel(device, N, "object_force", F, flags, (uchar)0u, object_sum);
+	kernel_object_force_by_link = Kernel(device, N, "object_force_by_link", fi, flags, t, (uchar)0u, object_force_links);
 	kernel_object_torque = Kernel(device, N, "object_torque", F, flags, (uchar)0u, 0.0f, 0.0f, 0.0f, object_sum);
 #endif // FORCE_FIELD
 
@@ -232,6 +235,11 @@ void LBM_Domain::enqueue_object_force(const uchar flag_marker) { // add up force
 	object_sum.enqueue_write_to_device();
 	kernel_object_force.set_parameters(2u, flag_marker).enqueue_run();
 	object_sum.enqueue_read_from_device();
+}
+void LBM_Domain::enqueue_object_force_by_link(const uchar flag_marker) { // add up force contributions binned by lattice link
+	object_force_links.reset(0.0f);
+	kernel_object_force_by_link.set_parameters(2u, t, flag_marker).enqueue_run();
+	object_force_links.enqueue_read_from_device();
 }
 void LBM_Domain::enqueue_object_torque(const float3& rotation_center, const uchar flag_marker) { // add up torque around specified rotation_center for all cells flagged with flag_marker
 	enqueue_update_force_field(); // update force field if it is not yet up-to-date
@@ -418,6 +426,7 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 	"\n	#define TYPE_G 0x20" // 0b00100000 // gas
 	"\n	#define TYPE_X 0x40" // 0b01000000 // reserved type X
 	"\n	#define TYPE_Y 0x80" // 0b10000000 // reserved type Y
+	"\n	#define TYPE_IBB TYPE_Y" // interpolated bounce-back marker for wall-adjacent fluid cells
 
 	"\n	#define TYPE_MS 0x03" // 0b00000011 // cell next to moving solid boundary
 	"\n	#define TYPE_BO 0x03" // 0b00000011 // any flag bit used for boundaries (temperature excluded)
@@ -478,7 +487,7 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 
 #ifdef SUBGRID
 	"\n	#define SUBGRID"
-	"\n	#define def_smagorinsky_C "+to_string(SUBGRID_SMAGORINSKY_C)+"f"
+	"\n	#define def_smagorinsky_C "+to_string(lbm_smagorinsky_C)+"f"
 #endif // SUBGRID
 
 #ifdef WALL_MODEL_SVBB
@@ -1067,6 +1076,19 @@ float3 LBM::object_force(const uchar flag_marker) { // add up force for all cell
 	float3 object_force = float3(0.0f, 0.0f, 0.0f);
 	for(uint d=0u; d<get_D(); d++) object_force += float3(lbm_domain[d]->object_sum.x[0], lbm_domain[d]->object_sum.y[0], lbm_domain[d]->object_sum.z[0]);
 	return object_force;
+}
+vector<float3> LBM::object_force_by_link(const uchar flag_marker) { // add up force contributions binned by lattice link
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_object_force_by_link(flag_marker);
+	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->finish_queue();
+	vector<float3> force_links(get_velocity_set(), float3(0.0f, 0.0f, 0.0f));
+	for(uint d=0u; d<get_D(); d++) {
+		for(uint i=0u; i<get_velocity_set(); i++) {
+			force_links[i].x += lbm_domain[d]->object_force_links[i];
+			force_links[i].y += lbm_domain[d]->object_force_links[(ulong)get_velocity_set()+i];
+			force_links[i].z += lbm_domain[d]->object_force_links[2ull*(ulong)get_velocity_set()+i];
+		}
+	}
+	return force_links;
 }
 float3 LBM::object_torque(const float3& rotation_center, const uchar flag_marker) { // add up torque around specified rotation center for all cells flagged with flag_marker
 	for(uint d=0u; d<get_D(); d++) lbm_domain[d]->enqueue_object_torque(rotation_center, flag_marker);

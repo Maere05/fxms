@@ -2138,6 +2138,42 @@ string opencl_c_container() { return R( // ########################## begin of O
 		if(local_sum.z!=0.0f) atomic_add_f(&object_sum[2], local_sum.z);
 	}
 } // object_force()
+)+R(kernel void object_force_by_link(const global fpxx* fi, const global uchar* flags, const ulong t, const uchar flag_marker, volatile global float* force_links) {
+	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
+	const uint lid = get_local_id(0);
+	local float3 cache[def_velocity_set*cl_workgroup_size];
+	const uint is_part_of_object = (uint)(n<(uxx)def_N&&flags[n]==flag_marker&&!is_halo(n));
+	uxx j[def_velocity_set];
+	float fhn[def_velocity_set];
+	if(is_part_of_object) {
+		neighbors(n, j);
+		load_f(n, fhn, fi, j, t);
+	}
+	for(uint i=0u; i<def_velocity_set; i++) {
+		cache[i*cl_workgroup_size+lid] = (float3)(0.0f, 0.0f, 0.0f);
+	}
+	if(is_part_of_object) {
+		for(uint i=1u; i<def_velocity_set; i++) {
+			const float3 ci = (float3)(c(i), c(def_velocity_set+i), c(2u*def_velocity_set+i));
+			cache[i*cl_workgroup_size+lid] = 2.0f*fhn[i]*ci;
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+	for(uint s=1u; s<cl_workgroup_size; s*=2u) {
+		if(lid%(2u*s)==0u) {
+			for(uint i=0u; i<def_velocity_set; i++) cache[i*cl_workgroup_size+lid] += cache[i*cl_workgroup_size+lid+s];
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+	if(lid==0u) {
+		for(uint i=0u; i<def_velocity_set; i++) {
+			const float3 local_sum = cache[i*cl_workgroup_size];
+			if(local_sum.x!=0.0f) atomic_add_f(&force_links[i], local_sum.x);
+			if(local_sum.y!=0.0f) atomic_add_f(&force_links[def_velocity_set+i], local_sum.y);
+			if(local_sum.z!=0.0f) atomic_add_f(&force_links[2u*def_velocity_set+i], local_sum.z);
+		}
+	}
+} // object_force_by_link()
 )+R(kernel void object_torque(const global float* F, const global uchar* flags, const uchar flag_marker, const float cx, const float cy, const float cz, volatile global float* object_sum) {
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	const uint lid = get_local_id(0); // local memory reduction of cl_workgroup_size:1

@@ -10,6 +10,7 @@ uint bytes_per_cell_host(); // returns the number of Bytes per cell allocated in
 uint bytes_per_cell_device(); // returns the number of Bytes per cell allocated in device memory
 uint bandwidth_bytes_per_cell_device(); // returns the bandwidth in Bytes per cell per time step from/to device memory
 uint3 resolution(const float3 box_aspect_ratio, const uint memory); // input: simulation box aspect ratio and VRAM occupation in MB, output: grid resolution
+extern float lbm_smagorinsky_C; // Smagorinsky-Lilly constant used when compiling OpenCL kernels
 
 string default_filename(const string& path, const string& name, const string& extension, const ulong t); // generate a default filename with timestamp
 string default_filename(const string& name, const string& extension, const ulong t); // generate a default filename with timestamp at exe_path/export/
@@ -78,6 +79,7 @@ private:
 	Kernel kernel_reset_force_field; // reset force field (also on TYPE_S cells)
 	Kernel kernel_object_center_of_mass; // calculate center of mass of all cells flagged with flag_marker
 	Kernel kernel_object_force; // add up force for all cells flagged with flag_marker
+	Kernel kernel_object_force_by_link; // add up force contributions binned by lattice link
 	Kernel kernel_object_torque; // add up torque around specified rotation_center for all cells flagged with flag_marker
 	ulong t_last_force_field = max_ulong; // optimization to not call kernel_update_force_field multiple times if F is already up-to-date
 #endif // FORCE_FIELD
@@ -113,6 +115,7 @@ public:
 #ifdef FORCE_FIELD
 	Memory<float> F; // individual force for every cell
 	Memory<float> object_sum; // sum of individual cell data for an object
+	Memory<float> object_force_links; // per-link object force bins: x[0..Q), y[0..Q), z[0..Q)
 #endif // FORCE_FIELD
 #ifdef SURFACE
 	Memory<float> phi; // fill level of every cell
@@ -146,6 +149,7 @@ public:
 	void enqueue_update_force_field(); // calculate forces from fluid on TYPE_S cells
 	void enqueue_object_center_of_mass(const uchar flag_marker=TYPE_S); // calculate center of mass of all cells flagged with flag_marker
 	void enqueue_object_force(const uchar flag_marker=TYPE_S); // add up force for all cells flagged with flag_marker
+	void enqueue_object_force_by_link(const uchar flag_marker=TYPE_S); // add up force contributions binned by lattice link
 	void enqueue_object_torque(const float3& rotation_center, const uchar flag_marker=TYPE_S); // add up torque around specified rotation_center for all cells flagged with flag_marker
 #endif // FORCE_FIELD
 #ifdef MOVING_BOUNDARIES
@@ -486,6 +490,7 @@ public:
 	void update_force_field(); // calculate forces from fluid on TYPE_S cells
 	float3 object_center_of_mass(const uchar flag_marker=TYPE_S); // calculate center of mass of all cells flagged with flag_marker
 	float3 object_force(const uchar flag_marker=TYPE_S); // add up force for all cells flagged with flag_marker
+	vector<float3> object_force_by_link(const uchar flag_marker=TYPE_S); // add up force contributions binned by lattice link
 	float3 object_torque(const float3& rotation_center, const uchar flag_marker=TYPE_S); // add up torque around specified rotation_center for all cells flagged with flag_marker
 #endif // FORCE_FIELD
 #ifdef MOVING_BOUNDARIES

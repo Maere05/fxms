@@ -15,7 +15,7 @@ from typing import Iterable, Sequence
 CASE_NAMES = ("all", "naca", "ahmed", "skijumper")
 RESEARCH_MEMORY_TIERS_MB = (20_000, 30_000, 40_000)
 TARGET_BANDS = {
-    "ahmed": {"Cd": (0.285, 0.298)},
+    "ahmed": {"mean_Cd": (0.285, 0.298)},
     "naca": {"Cd": (0.006, 0.008)},
     "skijumper": {"Fy_drag_N": (40.0, 45.0), "Fz_lift_N": (28.0, 32.0)},
 }
@@ -178,7 +178,7 @@ def load_run_log(root: Path | None = None):
 def summarize_runs(df):
     if df.empty:
         return df
-    columns = ["Fx_N", "Fy_drag_N", "Fz_lift_N", "Cd", "Cl", "Cs"]
+    columns = [c for c in ["Fx_N", "Fy_drag_N", "Fz_lift_N", "Cd", "Cl", "Cs", "mean_Cd", "mean_Cl", "mean_Cs"] if c in df.columns]
     return (
         df.groupby(["case", "memory_mb", "source_file"], dropna=False)[columns]
         .agg(["count", "mean", "std", "min", "max"])
@@ -202,6 +202,8 @@ def target_band_checks(df):
     for _, row in latest.iterrows():
         for metric, (target_min, target_max) in TARGET_BANDS.get(row["case"], {}).items():
             value = row.get(metric)
+            if metric == "mean_Cd" and pd.isna(value):
+                value = row.get("Cd")
             rows.append(
                 {
                     "case": row["case"],
@@ -223,7 +225,7 @@ def grid_independence_checks(df, low_memory_mb: int = 20_000, high_memory_mb: in
     if df.empty:
         return pd.DataFrame()
     rows = []
-    metrics = ("Cd", "Cl")
+    metrics = tuple(c for c in ("mean_Cd", "mean_Cl", "Cd", "Cl") if c in df.columns)
     means = df.groupby(["case", "memory_mb"], dropna=False)[list(metrics)].mean(numeric_only=True).reset_index()
     for case in sorted(means["case"].dropna().unique()):
         low = means[(means["case"] == case) & (means["memory_mb"] == low_memory_mb)]
@@ -256,7 +258,7 @@ def divergence_checks(df, growth_ratio_limit: float = 10.0):
 
     if df.empty:
         return pd.DataFrame()
-    metrics = ["Fx_N", "Fy_drag_N", "Fz_lift_N", "Cd", "Cl", "Cs"]
+    metrics = [c for c in ["Fx_N", "Fy_drag_N", "Fz_lift_N", "Cd", "Cl", "Cs", "mean_Cd", "mean_Cl", "mean_Cs"] if c in df.columns]
     rows = []
     for (case, memory_mb, source_file), run_df in df.sort_values("step").groupby(["case", "memory_mb", "source_file"], dropna=False):
         for metric in metrics:

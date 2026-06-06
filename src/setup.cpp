@@ -44,6 +44,9 @@ struct ForceValidationConfig {
 	ulong init_steps = 2000ull;
 	uint sample_count = 20u;
 	ulong sample_interval = 50ull;
+	ulong ahmed_init_convective_times = 15ull;
+	ulong ahmed_sample_convective_times = 30ull;
+	ulong ahmed_sample_interval = 10ull;
 };
 
 struct ForceValidationCase {
@@ -61,11 +64,71 @@ struct ForceValidationCase {
 	float stl_scale;
 };
 
+struct ForceValidationSchedule {
+	ulong steps_per_Tc = 0ull;
+	ulong init_steps = 0ull;
+	ulong sample_steps = 0ull;
+	ulong sample_interval = 0ull;
+	uint sample_count = 0u;
+};
+
+struct VoxelizedObjectBounds {
+	bool valid = false;
+	uint3 min = uint3(0u);
+	uint3 max = uint3(0u);
+	ulong cells = 0ull;
+	float si_width = 0.0f;
+	float si_height = 0.0f;
+	float si_frontal_area = 0.0f;
+	float si_min_z = 0.0f;
+};
+
+struct ForceValidationBoundarySummary {
+	ulong ground_solid_cells = 0ull;
+	ulong equilibrium_boundary_cells = 0ull;
+	ulong other_boundary_cells = 0ull;
+};
+
+struct ForceValidationIbbSummary {
+	ulong candidate_cells = 0ull;
+	ulong candidate_links = 0ull;
+	ulong sparse_hash_slots = 0ull;
+	ulong sparse_hash_bytes = 0ull;
+};
+
+struct ForceValidationSample {
+	float3 force = float3(0.0f);
+	float3 torque = float3(0.0f);
+	float Cd = 0.0f;
+	float Cl = 0.0f;
+	float Cs = 0.0f;
+	vector<float3> force_by_link;
+};
+
+struct ForceValidationRunningStats {
+	float3 force_sum = float3(0.0f);
+	float Cd_sum = 0.0f;
+	float Cl_sum = 0.0f;
+	float Cs_sum = 0.0f;
+	ulong samples = 0ull;
+	vector<float3> force_by_link_sum;
+};
+
 static const ForceValidationConfig force_validation_config;
 static const float NACA_AOA_DEG = 0.0f;
+#if defined(D2Q9)
+static const uint force_validation_velocity_set = 9u;
+#elif defined(D3Q15)
+static const uint force_validation_velocity_set = 15u;
+#elif defined(D3Q19)
+static const uint force_validation_velocity_set = 19u;
+#elif defined(D3Q27)
+static const uint force_validation_velocity_set = 27u;
+#endif // D3Q27
 
 static string force_validation_csv_path(const string& name, const int memory_in_mb) {
-	return get_exe_path()+"export/force_validation/"+name+"_"+to_string(memory_in_mb)+"MB.csv";
+	const string smagorinsky_suffix = fabsf(lbm_smagorinsky_C-SUBGRID_SMAGORINSKY_C)>1.0E-7f ? "_cs"+replace(to_string(lbm_smagorinsky_C, 4u), ".", "p") : "";
+	return get_exe_path()+"export/force_validation/"+name+"_"+to_string(memory_in_mb)+"MB"+smagorinsky_suffix+".csv";
 }
 
 #if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
@@ -110,8 +173,15 @@ static float wall_model_ww_B() {
 #endif // WALL_MODEL_SVBB
 }
 
+static string force_link_header_columns() {
+	string columns = "";
+	for(uint i=0u; i<force_validation_velocity_set; i++) columns += ",link"+to_string(i)+"_Fx_N,link"+to_string(i)+"_Fy_N,link"+to_string(i)+"_Fz_N";
+	for(uint i=0u; i<force_validation_velocity_set; i++) columns += ",mean_link"+to_string(i)+"_Fx_N,mean_link"+to_string(i)+"_Fy_N,mean_link"+to_string(i)+"_Fz_N";
+	return columns;
+}
+
 static void write_force_validation_header(const string& path) {
-	write_file(path, "case,memory_mb,Nx,Ny,Nz,step,time_s,Fx_N,Fy_drag_N,Fz_lift_N,Mx_Nm,My_Nm,Mz_Nm,Cd,Cl,Cs,Re,tau,nu_lbm,ref_area_m2,ref_length_m,wall_model,ww_A,ww_B\n");
+	write_file(path, "case,memory_mb,Nx,Ny,Nz,step,time_s,convective_time,sample_index,sample_count,Fx_N,Fy_drag_N,Fz_lift_N,Mx_Nm,My_Nm,Mz_Nm,Cd,Cl,Cs,mean_Fx_N,mean_Fy_drag_N,mean_Fz_lift_N,mean_Cd,mean_Cl,mean_Cs,Re,tau,nu_lbm,ref_area_m2,voxel_ref_area_m2,effective_ref_area_m2,ref_length_m,steps_per_Tc,init_steps,sample_steps,sample_interval,smagorinsky_c,ibb_candidate_cells,ibb_candidate_links,ibb_sparse_hash_bytes,wall_model,ww_A,ww_B"+force_link_header_columns()+"\n");
 }
 
 #if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
@@ -201,6 +271,83 @@ static void initialize_external_flow(LBM& lbm, const float lbm_u, const bool gro
 	});
 }
 
+static ForceValidationBoundarySummary force_validation_boundary_summary(LBM& lbm) {
+	ForceValidationBoundarySummary s;
+	const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz();
+	for(ulong n=0ull; n<lbm.get_N(); n++) {
+		uint x=0u, y=0u, z=0u;
+		lbm.coordinates(n, x, y, z);
+		if(!(x==0u||x==Nx-1u||y==0u||y==Ny-1u||z==0u||z==Nz-1u)) continue;
+		const uchar flagsn = lbm.flags[n];
+		if((flagsn&(TYPE_S|TYPE_E))==TYPE_S) s.ground_solid_cells++;
+		else if((flagsn&(TYPE_S|TYPE_E))==TYPE_E) s.equilibrium_boundary_cells++;
+		else s.other_boundary_cells++;
+	}
+	return s;
+}
+
+static ulong next_power_of_two(ulong x) {
+	ulong p = 1ull;
+	while(p<x&&p<(1ull<<63u)) p <<= 1u;
+	return p;
+}
+
+static int force_validation_link_c(const uint component, const uint i) {
+#if defined(D2Q9)
+	const int c[2u][9u] = {
+		{ 0, 1,-1, 0, 0, 1,-1, 1,-1 },
+		{ 0, 0, 0, 1,-1, 1,-1,-1, 1 }
+	};
+#elif defined(D3Q15)
+	const int c[3u][15u] = {
+		{ 0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 1,-1,-1, 1 },
+		{ 0, 0, 0, 1,-1, 0, 0, 1,-1, 1,-1,-1, 1, 1,-1 },
+		{ 0, 0, 0, 0, 0, 1,-1, 1,-1,-1, 1, 1,-1, 1,-1 }
+	};
+#elif defined(D3Q19)
+	const int c[3u][19u] = {
+		{ 0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 0, 0 },
+		{ 0, 0, 0, 1,-1, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 1,-1 },
+		{ 0, 0, 0, 0, 0, 1,-1, 0, 0, 1,-1, 1,-1, 0, 0,-1, 1,-1, 1 }
+	};
+#elif defined(D3Q27)
+	const int c[3u][27u] = {
+		{ 0, 1,-1, 0, 0, 0, 0, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 0, 0, 1,-1, 1,-1, 1,-1,-1, 1 },
+		{ 0, 0, 0, 1,-1, 0, 0, 1,-1, 0, 0, 1,-1,-1, 1, 0, 0, 1,-1, 1,-1, 1,-1,-1, 1, 1,-1 },
+		{ 0, 0, 0, 0, 0, 1,-1, 0, 0, 1,-1, 1,-1, 0, 0,-1, 1,-1, 1, 1,-1,-1, 1, 1,-1, 1,-1 }
+	};
+#endif // D3Q27
+	return c[component][i];
+}
+
+static ForceValidationIbbSummary mark_ibb_candidate_links(LBM& lbm, const uchar object_flag) {
+	ForceValidationIbbSummary s;
+	const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz();
+	for(ulong n=0ull; n<lbm.get_N(); n++) {
+		const uchar flagsn = lbm.flags[n];
+		if(flagsn&(TYPE_S|TYPE_E)) continue;
+		uint x=0u, y=0u, z=0u;
+		lbm.coordinates(n, x, y, z);
+		bool touches_object = false;
+		for(uint i=1u; i<force_validation_velocity_set; i++) {
+			const uint xn = (uint)(((int)x+force_validation_link_c(0u, i)+(int)Nx)%(int)Nx);
+			const uint yn = (uint)(((int)y+force_validation_link_c(1u, i)+(int)Ny)%(int)Ny);
+			const uint zn = (uint)(((int)z+force_validation_link_c(2u, i)+(int)Nz)%(int)Nz);
+			if(lbm.flags[lbm.index(xn, yn, zn)]==object_flag) {
+				s.candidate_links++;
+				touches_object = true;
+			}
+		}
+		if(touches_object) {
+			if((lbm.flags[n]&TYPE_IBB)==0u) s.candidate_cells++;
+			lbm.flags[n] = lbm.flags[n]|TYPE_IBB;
+		}
+	}
+	s.sparse_hash_slots = next_power_of_two(max(2ull*s.candidate_links, 1ull));
+	s.sparse_hash_bytes = s.sparse_hash_slots*(sizeof(ulong)+sizeof(uchar));
+	return s;
+}
+
 static ulong count_cells_equal_flag(LBM& lbm, const uchar flag) {
 	lbm.flags.read_from_device();
 	ulong cells = 0ull;
@@ -219,37 +366,127 @@ static ulong count_cells_with_flag_bit(LBM& lbm, const uchar flag) {
 	return cells;
 }
 
-static void append_force_sample(const ForceValidationCase& c, const int memory_in_mb, LBM& lbm, const float3& torque_center, const string& csv_path) {
+static ForceValidationSchedule force_validation_schedule(const ForceValidationCase& c) {
+	ForceValidationSchedule s;
+	if(c.name=="ahmed") {
+		const float Tc = c.si_ref_length/c.si_u;
+		s.steps_per_Tc = max(units.t(Tc), 1ull);
+		s.init_steps = max(force_validation_config.init_steps, force_validation_config.ahmed_init_convective_times*s.steps_per_Tc);
+		s.sample_steps = force_validation_config.ahmed_sample_convective_times*s.steps_per_Tc;
+		s.sample_interval = max(force_validation_config.ahmed_sample_interval, 1ull);
+		s.sample_count = (uint)min((s.sample_steps+s.sample_interval-1ull)/s.sample_interval, (ulong)max_uint);
+	} else {
+		s.steps_per_Tc = c.si_u>0.0f ? max(units.t(c.si_ref_length/c.si_u), 1ull) : 0ull;
+		s.init_steps = force_validation_config.init_steps;
+		s.sample_steps = (ulong)force_validation_config.sample_count*force_validation_config.sample_interval;
+		s.sample_interval = force_validation_config.sample_interval;
+		s.sample_count = force_validation_config.sample_count;
+	}
+	return s;
+}
+
+static VoxelizedObjectBounds voxelized_object_bounds(LBM& lbm, const uchar flag) {
+	VoxelizedObjectBounds b;
+	lbm.flags.read_from_device();
+	uint min_x=max_uint, min_y=max_uint, min_z=max_uint, max_x=0u, max_y=0u, max_z=0u;
+	for(ulong n=0ull; n<lbm.get_N(); n++) {
+		if(lbm.flags[n]==flag) {
+			uint x=0u, y=0u, z=0u;
+			lbm.coordinates(n, x, y, z);
+			min_x = min(min_x, x); min_y = min(min_y, y); min_z = min(min_z, z);
+			max_x = max(max_x, x); max_y = max(max_y, y); max_z = max(max_z, z);
+			b.cells++;
+		}
+	}
+	if(b.cells>0ull) {
+		b.valid = true;
+		b.min = uint3(min_x, min_y, min_z);
+		b.max = uint3(max_x, max_y, max_z);
+		b.si_width = units.si_x((float)(max_x-min_x+1u));
+		b.si_height = units.si_x((float)(max_z-min_z+1u));
+		b.si_frontal_area = b.si_width*b.si_height;
+		b.si_min_z = units.si_x((float)min_z);
+	}
+	return b;
+}
+
+static string format_uint3(const uint3& v) {
+	return "("+to_string(v.x)+","+to_string(v.y)+","+to_string(v.z)+")";
+}
+
+static string force_link_csv_values(const vector<float3>& links) {
+	string values = "";
+	for(uint i=0u; i<force_validation_velocity_set; i++) {
+		const float3 f = i<(uint)links.size() ? float3(units.si_F(links[i].x), units.si_F(links[i].y), units.si_F(links[i].z)) : float3(0.0f);
+		values += ","+csv_float(f.x)+","+csv_float(f.y)+","+csv_float(f.z);
+	}
+	return values;
+}
+
+static string mean_force_link_csv_values(const vector<float3>& link_sums, const ulong samples) {
+	string values = "";
+	const float inv_samples = samples>0ull ? 1.0f/(float)samples : 0.0f;
+	for(uint i=0u; i<force_validation_velocity_set; i++) {
+		const float3 f = i<(uint)link_sums.size() ? inv_samples*float3(units.si_F(link_sums[i].x), units.si_F(link_sums[i].y), units.si_F(link_sums[i].z)) : float3(0.0f);
+		values += ","+csv_float(f.x)+","+csv_float(f.y)+","+csv_float(f.z);
+	}
+	return values;
+}
+
+static float effective_ref_area(const ForceValidationCase& c, const VoxelizedObjectBounds& bounds) {
+	return c.name=="ahmed"&&bounds.valid&&bounds.si_frontal_area>0.0f ? bounds.si_frontal_area : c.si_ref_area;
+}
+
+static ForceValidationSample append_force_sample(const ForceValidationCase& c, const int memory_in_mb, LBM& lbm, const float3& torque_center, const string& csv_path, const ForceValidationSchedule& schedule, const VoxelizedObjectBounds& bounds, const ForceValidationIbbSummary& ibb, ForceValidationRunningStats& stats, const uint sample_index) {
+	ForceValidationSample sample;
 	const float3 lbm_force = lbm.object_force(TYPE_S|TYPE_X);
 	const float3 lbm_torque = lbm.object_torque(torque_center, TYPE_S|TYPE_X);
-	const float3 force = float3(units.si_F(lbm_force.x), units.si_F(lbm_force.y), units.si_F(lbm_force.z));
-	const float3 torque = float3(units.si_M(lbm_torque.x), units.si_M(lbm_torque.y), units.si_M(lbm_torque.z));
-	const float qA = 0.5f*force_validation_config.si_rho*sq(c.si_u)*c.si_ref_area;
-	const float Cd = qA>0.0f ? force.y/qA : 0.0f;
-	const float Cl = qA>0.0f ? force.z/qA : 0.0f;
-	const float Cs = qA>0.0f ? force.x/qA : 0.0f;
+	sample.force = float3(units.si_F(lbm_force.x), units.si_F(lbm_force.y), units.si_F(lbm_force.z));
+	sample.torque = float3(units.si_M(lbm_torque.x), units.si_M(lbm_torque.y), units.si_M(lbm_torque.z));
+	sample.force_by_link = lbm.object_force_by_link(TYPE_S|TYPE_X);
+	const float ref_area = effective_ref_area(c, bounds);
+	const float qA = 0.5f*force_validation_config.si_rho*sq(c.si_u)*ref_area;
+	sample.Cd = qA>0.0f ? sample.force.y/qA : 0.0f;
+	sample.Cl = qA>0.0f ? sample.force.z/qA : 0.0f;
+	sample.Cs = qA>0.0f ? sample.force.x/qA : 0.0f;
+	if(stats.force_by_link_sum.size()==0u) stats.force_by_link_sum = vector<float3>(sample.force_by_link.size(), float3(0.0f));
+	stats.samples++;
+	stats.force_sum += sample.force;
+	stats.Cd_sum += sample.Cd;
+	stats.Cl_sum += sample.Cl;
+	stats.Cs_sum += sample.Cs;
+	for(uint i=0u; i<(uint)sample.force_by_link.size(); i++) stats.force_by_link_sum[i] += sample.force_by_link[i];
+	const float inv_samples = 1.0f/(float)stats.samples;
+	const float3 mean_force = inv_samples*stats.force_sum;
+	const float mean_Cd = inv_samples*stats.Cd_sum;
+	const float mean_Cl = inv_samples*stats.Cl_sum;
+	const float mean_Cs = inv_samples*stats.Cs_sum;
 	const float Re = units.si_Re(c.si_ref_length, c.si_u, force_validation_config.si_nu);
+	const float convective_time = c.si_ref_length>0.0f ? units.si_t(lbm.get_t())/(c.si_ref_length/c.si_u) : 0.0f;
 	const string line = "FORCE_VALIDATION case="+c.name+
 		" memory_mb="+to_string(memory_in_mb)+
 		" step="+to_string(lbm.get_t())+
-		" Fx_N="+csv_float(force.x)+
-		" Fy_drag_N="+csv_float(force.y)+
-		" Fz_lift_N="+csv_float(force.z)+
-		" Mx_Nm="+csv_float(torque.x)+
-		" My_Nm="+csv_float(torque.y)+
-		" Mz_Nm="+csv_float(torque.z)+
-		" Cd="+csv_float(Cd)+
-		" Cl="+csv_float(Cl)+
-		" Cs="+csv_float(Cs);
+		" convective_time="+csv_float(convective_time)+
+		" Fx_N="+csv_float(sample.force.x)+
+		" Fy_drag_N="+csv_float(sample.force.y)+
+		" Fz_lift_N="+csv_float(sample.force.z)+
+		" Cd="+csv_float(sample.Cd)+
+		" mean_Cd="+csv_float(mean_Cd);
 	print_info(line);
 	write_line(csv_path, c.name+","+to_string(memory_in_mb)+","+csv_uint3(uint3(lbm.get_Nx(), lbm.get_Ny(), lbm.get_Nz()))+","+
-		to_string(lbm.get_t())+","+csv_float(units.si_t(lbm.get_t()))+","+
-		csv_float(force.x)+","+csv_float(force.y)+","+csv_float(force.z)+","+
-		csv_float(torque.x)+","+csv_float(torque.y)+","+csv_float(torque.z)+","+
-		csv_float(Cd)+","+csv_float(Cl)+","+csv_float(Cs)+","+
+		to_string(lbm.get_t())+","+csv_float(units.si_t(lbm.get_t()))+","+csv_float(convective_time)+","+to_string(sample_index)+","+to_string(schedule.sample_count)+","+
+		csv_float(sample.force.x)+","+csv_float(sample.force.y)+","+csv_float(sample.force.z)+","+
+		csv_float(sample.torque.x)+","+csv_float(sample.torque.y)+","+csv_float(sample.torque.z)+","+
+		csv_float(sample.Cd)+","+csv_float(sample.Cl)+","+csv_float(sample.Cs)+","+
+		csv_float(mean_force.x)+","+csv_float(mean_force.y)+","+csv_float(mean_force.z)+","+
+		csv_float(mean_Cd)+","+csv_float(mean_Cl)+","+csv_float(mean_Cs)+","+
 		csv_float(Re)+","+csv_float(lbm.get_tau())+","+csv_float(lbm.get_nu())+","+
-		csv_float(c.si_ref_area)+","+csv_float(c.si_ref_length)+","+
-		wall_model_name()+","+csv_float(wall_model_ww_A())+","+csv_float(wall_model_ww_B()));
+		csv_float(c.si_ref_area)+","+csv_float(bounds.valid ? bounds.si_frontal_area : 0.0f)+","+csv_float(ref_area)+","+csv_float(c.si_ref_length)+","+
+		to_string(schedule.steps_per_Tc)+","+to_string(schedule.init_steps)+","+to_string(schedule.sample_steps)+","+to_string(schedule.sample_interval)+","+csv_float(lbm_smagorinsky_C)+","+
+		to_string(ibb.candidate_cells)+","+to_string(ibb.candidate_links)+","+to_string(ibb.sparse_hash_bytes)+","+
+		wall_model_name()+","+csv_float(wall_model_ww_A())+","+csv_float(wall_model_ww_B())+
+		force_link_csv_values(sample.force_by_link)+mean_force_link_csv_values(stats.force_by_link_sum, stats.samples));
+	return sample;
 }
 
 static void run_force_validation_case(const ForceValidationCase& c, const int memory_in_mb) {
@@ -257,17 +494,20 @@ static void run_force_validation_case(const ForceValidationCase& c, const int me
 	const uint3 lbm_N = resolution(c.si_domain, (uint)memory_in_mb);
 	units.set_m_kg_s((float)lbm_N.y, force_validation_config.lbm_u, 1.0f, c.si_domain.y, c.si_u, force_validation_config.si_rho);
 	const float lbm_nu = units.nu(force_validation_config.si_nu);
+	const ForceValidationSchedule schedule = force_validation_schedule(c);
 	print_info("FORCE_VALIDATION_GRID case="+c.name+" Nx="+to_string(lbm_N.x)+" Ny="+to_string(lbm_N.y)+" Nz="+to_string(lbm_N.z)+" nu_lbm="+to_string(lbm_nu, 9u));
 	print_info("FORCE_VALIDATION_DOMAIN case="+c.name+" si_domain_m="+format_float3(c.si_domain)+" si_mesh_size_m="+format_float3(c.si_mesh_size));
 	print_info("FORCE_VALIDATION_REFERENCE case="+c.name+" ref_area_kind="+c.ref_area_kind+" ref_area_m2="+csv_float(c.si_ref_area)+" ref_length_m="+csv_float(c.si_ref_length));
 	print_info("FORCE_VALIDATION_RE case="+c.name+" Re="+to_string(to_uint(units.si_Re(c.si_ref_length, c.si_u, force_validation_config.si_nu))));
+	print_info("FORCE_VALIDATION_LES case="+c.name+" smagorinsky_c="+csv_float(lbm_smagorinsky_C));
+	print_info("FORCE_VALIDATION_SCHEDULE case="+c.name+" steps_per_Tc="+to_string(schedule.steps_per_Tc)+" init_steps="+to_string(schedule.init_steps)+" sample_steps="+to_string(schedule.sample_steps)+" sample_interval="+to_string(schedule.sample_interval)+" sample_count="+to_string(schedule.sample_count));
 	LBM lbm(lbm_N, lbm_nu);
 	Mesh* mesh = read_lbm_mesh(c, lbm_N);
 	print_info("FORCE_VALIDATION_MESH_LOADED case="+c.name+" pmin="+format_float3(mesh->pmin)+" pmax="+format_float3(mesh->pmax)+" size_cells="+format_float3(mesh_size(mesh)));
 	if(c.name=="ahmed") {
 		const float x_center = 0.5f*(float)lbm_N.x;
-		const float y_center = 0.5f*(float)lbm_N.y;
-		mesh->translate(float3(x_center-mesh_bounds_center(mesh).x, y_center-mesh_bounds_center(mesh).y, 1.0f-mesh->pmin.z));
+		const float y_min = units.x(2.5f*c.si_ref_length);
+		mesh->translate(float3(x_center-mesh_bounds_center(mesh).x, y_min-mesh->pmin.y, 1.0f-mesh->pmin.z));
 	} else if(!c.fit_mesh_to_domain) {
 		const float3 target_center = float3(0.5f*(float)lbm_N.x, 0.30f*(float)lbm_N.y, c.ground ? 0.0f : 0.5f*(float)lbm_N.z);
 		place_mesh(mesh, target_center);
@@ -276,7 +516,32 @@ static void run_force_validation_case(const ForceValidationCase& c, const int me
 	print_info("FORCE_VALIDATION_MESH_PLACED case="+c.name+" pmin="+format_float3(mesh->pmin)+" pmax="+format_float3(mesh->pmax)+" size_cells="+format_float3(mesh_size(mesh)));
 	lbm.voxelize_mesh_on_device(mesh, TYPE_S|TYPE_X);
 	print_info("FORCE_VALIDATION_VOXELS case="+c.name+" exact_sx_cells="+to_string(count_cells_equal_flag(lbm, TYPE_S|TYPE_X))+" any_s_cells="+to_string(count_cells_with_flag_bit(lbm, TYPE_S))+" any_x_cells="+to_string(count_cells_with_flag_bit(lbm, TYPE_X)));
+	const VoxelizedObjectBounds bounds = voxelized_object_bounds(lbm, TYPE_S|TYPE_X);
+	if(bounds.valid) {
+		print_info("FORCE_VALIDATION_VOXEL_BOUNDS case="+c.name+
+			" min="+format_uint3(bounds.min)+
+			" max="+format_uint3(bounds.max)+
+			" cells="+to_string(bounds.cells)+
+			" si_width_m="+csv_float(bounds.si_width)+
+			" si_height_m="+csv_float(bounds.si_height)+
+			" voxel_ref_area_m2="+csv_float(bounds.si_frontal_area)+
+			" si_min_z_m="+csv_float(bounds.si_min_z));
+	}
 	initialize_external_flow(lbm, force_validation_config.lbm_u, c.ground);
+	const ForceValidationBoundarySummary boundary_summary = force_validation_boundary_summary(lbm);
+	print_info("FORCE_VALIDATION_BOUNDARIES case="+c.name+
+		" ground_solid_cells="+to_string(boundary_summary.ground_solid_cells)+
+		" equilibrium_boundary_cells="+to_string(boundary_summary.equilibrium_boundary_cells)+
+		" other_boundary_cells="+to_string(boundary_summary.other_boundary_cells));
+	const ForceValidationIbbSummary ibb_summary = c.name=="ahmed" ? mark_ibb_candidate_links(lbm, TYPE_S|TYPE_X) : ForceValidationIbbSummary();
+	if(c.name=="ahmed") {
+		print_info("FORCE_VALIDATION_IBB_CANDIDATES case="+c.name+
+			" cells="+to_string(ibb_summary.candidate_cells)+
+			" links="+to_string(ibb_summary.candidate_links)+
+			" sparse_hash_slots="+to_string(ibb_summary.sparse_hash_slots)+
+			" sparse_hash_bytes="+to_string(ibb_summary.sparse_hash_bytes)+
+			" marker=TYPE_IBB");
+	}
 #ifdef GRAPHICS
 	lbm.graphics.visualization_modes = VIS_FLAG_LATTICE|VIS_FLAG_SURFACE;
 	lbm.graphics.field_mode = 0;
@@ -290,14 +555,18 @@ static void run_force_validation_case(const ForceValidationCase& c, const int me
 	const string wall_diag_csv_path = force_validation_wall_diag_csv_path(c.name, memory_in_mb);
 	if(write_wall_diag) write_wall_diag_header(wall_diag_csv_path);
 #endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
-	lbm.run(force_validation_config.init_steps);
+	lbm.run(schedule.init_steps);
 	const float3 torque_center = lbm.object_center_of_mass(TYPE_S|TYPE_X);
-	for(uint i=0u; i<force_validation_config.sample_count; i++) {
+	ForceValidationRunningStats stats;
+	for(uint i=0u; i<schedule.sample_count; i++) {
 #if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
 		if(write_wall_diag) lbm.reset_wall_diagnostics();
 #endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
-		lbm.run(force_validation_config.sample_interval);
-		append_force_sample(c, memory_in_mb, lbm, torque_center, csv_path);
+		const ulong remaining_steps = schedule.init_steps+schedule.sample_steps>lbm.get_t() ? schedule.init_steps+schedule.sample_steps-lbm.get_t() : 0ull;
+		const ulong run_steps = min(schedule.sample_interval, remaining_steps);
+		if(run_steps==0ull) break;
+		lbm.run(run_steps);
+		append_force_sample(c, memory_in_mb, lbm, torque_center, csv_path, schedule, bounds, ibb_summary, stats, i+1u);
 #if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
 		if(write_wall_diag) append_wall_diag_sample(c, memory_in_mb, lbm, wall_diag_csv_path);
 #endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
@@ -338,7 +607,6 @@ static ForceValidationCase make_ahmed_case() {
 	const float width = 0.389f;
 	const float length = 1.044f;
 	const float height = 0.288f;
-	const float box_scale = 6.0f;
 	Mesh* preview = read_preview_mesh(path, rotation);
 	const float3 preview_size = mesh_size(preview);
 	delete preview;
@@ -353,7 +621,7 @@ static ForceValidationCase make_ahmed_case() {
 	c.si_ref_area = width*height;
 	c.ref_area_kind = "frontal_width_height";
 	c.si_u = 40.0f;
-	c.si_domain = float3(box_scale*width, box_scale*length, 0.5f*(box_scale-1.0f)*width+height);
+	c.si_domain = float3(5.0f*width, 11.5f*length, 5.0f*height);
 	c.ground = true;
 	c.fit_mesh_to_domain = false;
 	c.stl_scale = axis_scale;
@@ -397,7 +665,7 @@ void sim_skijumper(int memory_in_mb) {
 }
 
 static void print_force_validation_usage() {
-	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [gpu_id ...]");
+	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [--smagorinsky C] [gpu_id ...]");
 	print_info("Defaults: ahmed 2000 0");
 }
 
@@ -405,20 +673,37 @@ void main_setup() {
 	string suite = "ahmed";
 	int memory_in_mb = 2000;
 	vector<string> gpu_arguments;
-	bool first_argument_is_memory = false;
+	uint argument_begin = 0u;
 	if(main_arguments.size()>0u) {
 		const string arg0 = to_lower(main_arguments[0]);
 		if(is_number(arg0)) {
 			memory_in_mb = to_int(arg0);
-			first_argument_is_memory = true;
+			argument_begin = 1u;
 		} else {
 			suite = arg0;
+			argument_begin = 1u;
 		}
 	}
-	if(!first_argument_is_memory&&main_arguments.size()>1u&&is_number(main_arguments[1])) memory_in_mb = to_int(main_arguments[1]);
+	if(argument_begin<(uint)main_arguments.size()&&is_number(main_arguments[argument_begin])) {
+		memory_in_mb = to_int(main_arguments[argument_begin]);
+		argument_begin++;
+	}
 	if(memory_in_mb<=0) print_error("Force-validation memory must be greater than 0 MB.");
-	const uint gpu_arg_begin = first_argument_is_memory ? 1u : 2u;
-	for(uint i=gpu_arg_begin; i<(uint)main_arguments.size(); i++) gpu_arguments.push_back(main_arguments[i]);
+	for(uint i=argument_begin; i<(uint)main_arguments.size(); i++) {
+		const string arg = to_lower(main_arguments[i]);
+		if((arg=="--smagorinsky"||arg=="--smagorinsky-c"||arg=="--cs")&&i+1u<(uint)main_arguments.size()) {
+			lbm_smagorinsky_C = to_float(main_arguments[++i]);
+		} else if(begins_with(arg, "--smagorinsky=")) {
+			lbm_smagorinsky_C = to_float(substring(main_arguments[i], 14u));
+		} else if(begins_with(arg, "--smagorinsky-c=")) {
+			lbm_smagorinsky_C = to_float(substring(main_arguments[i], 16u));
+		} else if(begins_with(arg, "--cs=")) {
+			lbm_smagorinsky_C = to_float(substring(main_arguments[i], 5u));
+		} else {
+			gpu_arguments.push_back(main_arguments[i]);
+		}
+	}
+	if(lbm_smagorinsky_C<0.0f) print_error("Smagorinsky constant must be non-negative.");
 	if(gpu_arguments.size()==0u) gpu_arguments.push_back("0");
 	main_arguments = gpu_arguments;
 	print_force_validation_usage();

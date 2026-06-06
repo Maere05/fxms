@@ -22,7 +22,7 @@
 //#define SURFACE // enables free surface LBM: mark fluid cells with TYPE_F; at initialization the TYPE_I interface and TYPE_G gas domains will automatically be completed; allocates an extra 12 Bytes/cell
 //#define TEMPERATURE // enables temperature extension; set fixed-temperature cells with TYPE_T (similar to EQUILIBRIUM_BOUNDARIES); allocates an extra 32 (FP32) or 18 (FP16) Bytes/cell
 #define SUBGRID // enables Smagorinsky-Lilly subgrid turbulence LES model to keep simulations with very large Reynolds number stable
-#define SUBGRID_SMAGORINSKY_C 0.17326595f // Smagorinsky-Lilly constant; default preserves FluidX3D's historical coefficient
+#define SUBGRID_SMAGORINSKY_C 0.13f // Smagorinsky-Lilly constant; lower value preserves Ahmed wake structures better in validation
 #define WALL_MODEL_SVBB // enables slip-velocity bounce-back wall modeling for under-resolved turbulent solid boundaries
 #define WALL_WERNER_WENGLE_A 8.3f // Werner-Wengle wall-law constant A
 #define WALL_WERNER_WENGLE_B (1.0f/7.0f) // Werner-Wengle wall-law constant B
@@ -73,6 +73,7 @@
 #define TYPE_G 0b00100000 // gas
 #define TYPE_X 0b01000000 // reserved type X
 #define TYPE_Y 0b10000000 // reserved type Y
+#define TYPE_IBB TYPE_Y // interpolated bounce-back marker for wall-adjacent fluid cells
 
 #define VIS_FLAG_LATTICE  0b00000001 // lbm.graphics.visualization_modes = VIS_...|VIS_...|VIS_...;
 #define VIS_FLAG_SURFACE  0b00000010
