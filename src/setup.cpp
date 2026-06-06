@@ -115,6 +115,8 @@ struct ForceValidationRunningStats {
 };
 
 static const ForceValidationConfig force_validation_config;
+static uint3 force_validation_domains = uint3(1u);
+static bool force_validation_domains_explicit = false;
 static const float NACA_AOA_DEG = 0.0f;
 #if defined(D2Q9)
 static const uint force_validation_velocity_set = 9u;
@@ -501,7 +503,8 @@ static void run_force_validation_case(const ForceValidationCase& c, const int me
 	print_info("FORCE_VALIDATION_RE case="+c.name+" Re="+to_string(to_uint(units.si_Re(c.si_ref_length, c.si_u, force_validation_config.si_nu))));
 	print_info("FORCE_VALIDATION_LES case="+c.name+" smagorinsky_c="+csv_float(lbm_smagorinsky_C));
 	print_info("FORCE_VALIDATION_SCHEDULE case="+c.name+" steps_per_Tc="+to_string(schedule.steps_per_Tc)+" init_steps="+to_string(schedule.init_steps)+" sample_steps="+to_string(schedule.sample_steps)+" sample_interval="+to_string(schedule.sample_interval)+" sample_count="+to_string(schedule.sample_count));
-	LBM lbm(lbm_N, lbm_nu);
+	print_info("FORCE_VALIDATION_DOMAINS case="+c.name+" Dx="+to_string(force_validation_domains.x)+" Dy="+to_string(force_validation_domains.y)+" Dz="+to_string(force_validation_domains.z));
+	LBM lbm(lbm_N, force_validation_domains.x, force_validation_domains.y, force_validation_domains.z, lbm_nu);
 	Mesh* mesh = read_lbm_mesh(c, lbm_N);
 	print_info("FORCE_VALIDATION_MESH_LOADED case="+c.name+" pmin="+format_float3(mesh->pmin)+" pmax="+format_float3(mesh->pmax)+" size_cells="+format_float3(mesh_size(mesh)));
 	if(c.name=="ahmed") {
@@ -665,8 +668,16 @@ void sim_skijumper(int memory_in_mb) {
 }
 
 static void print_force_validation_usage() {
-	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [--smagorinsky C] [gpu_id ...]");
+	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [--smagorinsky C] [--domains Dx,Dy,Dz] [gpu_id ...]");
 	print_info("Defaults: ahmed 2000 0");
+}
+
+static uint3 parse_force_validation_domains(const string& value) {
+	const vector<string> parts = split_regex(replace(to_lower(value), "x", ","), "\\s*,\\s*");
+	if(parts.size()!=3u) print_error("Force-validation domains must be formatted as Dx,Dy,Dz or Dx x Dy x Dz.");
+	const uint3 domains = uint3(to_uint(parts[0]), to_uint(parts[1]), to_uint(parts[2]));
+	if(domains.x==0u||domains.y==0u||domains.z==0u) print_error("Force-validation domain counts must be greater than zero.");
+	return domains;
 }
 
 void main_setup() {
@@ -699,12 +710,20 @@ void main_setup() {
 			lbm_smagorinsky_C = to_float(substring(main_arguments[i], 16u));
 		} else if(begins_with(arg, "--cs=")) {
 			lbm_smagorinsky_C = to_float(substring(main_arguments[i], 5u));
+		} else if(arg=="--domains"&&i+1u<(uint)main_arguments.size()) {
+			force_validation_domains = parse_force_validation_domains(main_arguments[++i]);
+			force_validation_domains_explicit = true;
+		} else if(begins_with(arg, "--domains=")) {
+			force_validation_domains = parse_force_validation_domains(substring(main_arguments[i], 10u));
+			force_validation_domains_explicit = true;
 		} else {
 			gpu_arguments.push_back(main_arguments[i]);
 		}
 	}
 	if(lbm_smagorinsky_C<0.0f) print_error("Smagorinsky constant must be non-negative.");
 	if(gpu_arguments.size()==0u) gpu_arguments.push_back("0");
+	if(!force_validation_domains_explicit&&gpu_arguments.size()>1u) force_validation_domains = uint3(1u, (uint)gpu_arguments.size(), 1u);
+	if(force_validation_domains.x*force_validation_domains.y*force_validation_domains.z!=(uint)gpu_arguments.size()) print_error("Number of GPU IDs must match force-validation domains.");
 	main_arguments = gpu_arguments;
 	print_force_validation_usage();
 	if(suite=="all") {
