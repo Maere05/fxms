@@ -322,27 +322,34 @@ static int force_validation_link_c(const uint component, const uint i) {
 	return c[component][i];
 }
 
-static ForceValidationIbbSummary mark_ibb_candidate_links(LBM& lbm, const uchar object_flag) {
+static ForceValidationIbbSummary mark_ibb_candidate_links(LBM& lbm, const uchar object_flag, const VoxelizedObjectBounds& bounds) {
 	ForceValidationIbbSummary s;
+	if(!bounds.valid) return s;
 	const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz();
-	for(ulong n=0ull; n<lbm.get_N(); n++) {
-		const uchar flagsn = lbm.flags[n];
-		if(flagsn&(TYPE_S|TYPE_E)) continue;
-		uint x=0u, y=0u, z=0u;
-		lbm.coordinates(n, x, y, z);
-		bool touches_object = false;
-		for(uint i=1u; i<force_validation_velocity_set; i++) {
-			const uint xn = (uint)(((int)x+force_validation_link_c(0u, i)+(int)Nx)%(int)Nx);
-			const uint yn = (uint)(((int)y+force_validation_link_c(1u, i)+(int)Ny)%(int)Ny);
-			const uint zn = (uint)(((int)z+force_validation_link_c(2u, i)+(int)Nz)%(int)Nz);
-			if(lbm.flags[lbm.index(xn, yn, zn)]==object_flag) {
-				s.candidate_links++;
-				touches_object = true;
+	const uint x0 = bounds.min.x>0u ? bounds.min.x-1u : 0u, x1 = bounds.max.x+1u<Nx ? bounds.max.x+1u : Nx-1u;
+	const uint y0 = bounds.min.y>0u ? bounds.min.y-1u : 0u, y1 = bounds.max.y+1u<Ny ? bounds.max.y+1u : Ny-1u;
+	const uint z0 = bounds.min.z>0u ? bounds.min.z-1u : 0u, z1 = bounds.max.z+1u<Nz ? bounds.max.z+1u : Nz-1u;
+	for(uint z=z0; z<=z1; z++) {
+		for(uint y=y0; y<=y1; y++) {
+			for(uint x=x0; x<=x1; x++) {
+				const ulong n = lbm.index(x, y, z);
+				const uchar flagsn = lbm.flags[n];
+				if(flagsn&(TYPE_S|TYPE_E)) continue;
+				bool touches_object = false;
+				for(uint i=1u; i<force_validation_velocity_set; i++) {
+					const uint xn = (uint)(((int)x+force_validation_link_c(0u, i)+(int)Nx)%(int)Nx);
+					const uint yn = (uint)(((int)y+force_validation_link_c(1u, i)+(int)Ny)%(int)Ny);
+					const uint zn = (uint)(((int)z+force_validation_link_c(2u, i)+(int)Nz)%(int)Nz);
+					if(lbm.flags[lbm.index(xn, yn, zn)]==object_flag) {
+						s.candidate_links++;
+						touches_object = true;
+					}
+				}
+				if(touches_object) {
+					if((lbm.flags[n]&TYPE_IBB)==0u) s.candidate_cells++;
+					lbm.flags[n] = lbm.flags[n]|TYPE_IBB;
+				}
 			}
-		}
-		if(touches_object) {
-			if((lbm.flags[n]&TYPE_IBB)==0u) s.candidate_cells++;
-			lbm.flags[n] = lbm.flags[n]|TYPE_IBB;
 		}
 	}
 	s.sparse_hash_slots = next_power_of_two(s.candidate_links>0ull ? 2ull*s.candidate_links : 1ull);
@@ -536,7 +543,7 @@ static void run_force_validation_case(const ForceValidationCase& c, const int me
 		" ground_solid_cells="+to_string(boundary_summary.ground_solid_cells)+
 		" equilibrium_boundary_cells="+to_string(boundary_summary.equilibrium_boundary_cells)+
 		" other_boundary_cells="+to_string(boundary_summary.other_boundary_cells));
-	const ForceValidationIbbSummary ibb_summary = c.name=="ahmed" ? mark_ibb_candidate_links(lbm, TYPE_S|TYPE_X) : ForceValidationIbbSummary();
+	const ForceValidationIbbSummary ibb_summary = c.name=="ahmed" ? mark_ibb_candidate_links(lbm, TYPE_S|TYPE_X, bounds) : ForceValidationIbbSummary();
 	if(c.name=="ahmed") {
 		print_info("FORCE_VALIDATION_IBB_CANDIDATES case="+c.name+
 			" cells="+to_string(ibb_summary.candidate_cells)+
