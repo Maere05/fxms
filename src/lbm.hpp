@@ -74,12 +74,22 @@ private:
 	Kernel kernel_update_fields; // reads DDFs and updates (rho, u, T) in device memory
 	Memory<fpxx> fi; // LBM density distribution functions (DDFs); only exist in device memory
 	ulong t_last_update_fields = max_ulong; // optimization to not call kernel_update_fields multiple times if (rho, u, T) are already up-to-date
+#ifdef INTERPOLATED_BOUNCE_BACK
+	Memory<ulong> ibb_keys; // sparse BFL table keys: (local_n<<5)|link_i
+	Memory<uchar> ibb_q; // sparse BFL q values encoded as 1..255, 0 means empty
+	uint ibb_slot_mask = 0u;
+	bool ibb_active = false;
+#endif // INTERPOLATED_BOUNCE_BACK
 #ifdef FORCE_FIELD
 	Kernel kernel_update_force_field; // calculate forces from fluid on TYPE_S cells
 	Kernel kernel_reset_force_field; // reset force field (also on TYPE_S cells)
 	Kernel kernel_object_center_of_mass; // calculate center of mass of all cells flagged with flag_marker
 	Kernel kernel_object_force; // add up force for all cells flagged with flag_marker
 	Kernel kernel_object_force_by_link; // add up force contributions binned by lattice link
+#ifdef INTERPOLATED_BOUNCE_BACK
+	Kernel kernel_object_force_ibb; // BFL-aware force summation over TYPE_IBB fluid cells
+	Kernel kernel_object_force_by_link_ibb; // BFL-aware per-link force bins
+#endif // INTERPOLATED_BOUNCE_BACK
 	Kernel kernel_object_torque; // add up torque around specified rotation_center for all cells flagged with flag_marker
 	ulong t_last_force_field = max_ulong; // optimization to not call kernel_update_force_field multiple times if F is already up-to-date
 #endif // FORCE_FIELD
@@ -139,6 +149,10 @@ public:
 	void enqueue_initialize(); // write all data fields to device and call kernel_initialize
 	void enqueue_stream_collide(); // call kernel_stream_collide to perform one LBM time step
 	void enqueue_update_fields(); // update fields (rho, u, T) manually
+#ifdef INTERPOLATED_BOUNCE_BACK
+	void upload_ibb_table(const vector<ulong>& keys, const vector<uchar>& q, const uint slot_mask);
+	bool has_ibb_table() const { return ibb_active&&ibb_slot_mask!=0u; }
+#endif // INTERPOLATED_BOUNCE_BACK
 #ifdef SURFACE
 	void enqueue_surface_0();
 	void enqueue_surface_1();
@@ -503,6 +517,10 @@ public:
 	void reset_wall_diagnostics();
 	Wall_Diagnostics wall_diagnostics();
 #endif // WALL_MODEL_SVBB && WALL_MODEL_DIAGNOSTICS
+#ifdef INTERPOLATED_BOUNCE_BACK
+	void upload_ibb_table(const uint domain, const vector<ulong>& keys, const vector<uchar>& q, const uint slot_mask);
+	bool has_ibb_table() const;
+#endif // INTERPOLATED_BOUNCE_BACK
 
 	uint get_Nx() const { return Nx; } // get (global) lattice dimensions in x-direction
 	uint get_Ny() const { return Ny; } // get (global) lattice dimensions in y-direction

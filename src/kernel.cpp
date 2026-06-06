@@ -1132,6 +1132,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 } // apply_moving_boundaries()
 )+"#endif"+R( // MOVING_BOUNDARIES
 
+)+R(uint reflected_link_i(const uint i) {
+	return (i&1u) ? i+1u : i-1u;
+}
 )+"#ifdef WALL_MODEL_SVBB"+R(
 )+"#ifdef WALL_MODEL_DIAGNOSTICS"+R(
 )+R(void wall_diag_add_u(volatile global uint* wall_diag_u, const uint i) {
@@ -1267,9 +1270,6 @@ string opencl_c_container() { return R( // ########################## begin of O
 	}
 } // apply_svbb_wall_model()
 )+"#endif"+R( // WALL_MODEL_DIAGNOSTICS
-)+R(uint reflected_link_i(const uint i) {
-	return (i&1u) ? i+1u : i-1u;
-}
 )+"#endif"+R( // WALL_MODEL_SVBB
 
 )+"#ifdef SURFACE"+R(
@@ -1498,13 +1498,64 @@ string opencl_c_container() { return R( // ########################## begin of O
 	}
 }
 
-)+"#ifdef SURFACE"+R(
 )+R(void load_f_outgoing(const uxx n, float* fon, const global fpxx* fi, const uxx* j, const ulong t) { // load outgoing DDFs, even: 1:1 like stream-out odd, odd: 1:1 like stream-out even
 	for(uint i=1u; i<def_velocity_set; i+=2u) { // Esoteric-Pull
 		fon[i   ] = load(fi, index_f(j[i], t%2ul ? i    : i+1u));
 		fon[i+1u] = load(fi, index_f(n   , t%2ul ? i+1u : i   ));
 	}
 }
+
+)+"#ifdef INTERPOLATED_BOUNCE_BACK"+R(
+)+R(uint ibb_hash(const ulong key) {
+	ulong x = key;
+	x ^= x>>33;
+	x *= 0xff51afd7ed558ccdUL;
+	x ^= x>>33;
+	x *= 0xc4ceb9fe1a85ec53UL;
+	x ^= x>>33;
+	return (uint)x;
+}
+)+R(float ibb_lookup_q(const uxx n, const uint link_i, const global ulong* ibb_keys, const global uchar* ibb_q, const uint ibb_slot_mask) {
+	if(ibb_slot_mask==0u) return 0.0f;
+	const ulong key = (((ulong)n)<<5u)|(ulong)link_i;
+	uint slot = ibb_hash(key)&ibb_slot_mask;
+	for(uint probe=0u; probe<32u; probe++) {
+		const uchar q = ibb_q[slot];
+		if(q==0u) return 0.0f;
+		if(ibb_keys[slot]==key) return (float)q*(1.0f/255.0f);
+		slot = (slot+1u)&ibb_slot_mask;
+	}
+	return 0.0f;
+}
+)+R(float ibb_reconstructed_population(const uxx n, const uint link_i, const uint ref_i, const uxx* j, global fpxx* fi, const global uchar* flags, const ulong t, const global ulong* ibb_keys, const global uchar* ibb_q, const uint ibb_slot_mask, const float* fhn, const float* fon) {
+	const float q = ibb_lookup_q(n, link_i, ibb_keys, ibb_q, ibb_slot_mask);
+	if(q<=0.0f) return fhn[ref_i];
+	const float f_i = fon[link_i];
+	if(q<0.5f) {
+		const uxx xff = j[ref_i];
+		if(!is_halo(xff)&&(flags[xff]&TYPE_BO)!=TYPE_S) {
+			uxx jff[def_velocity_set];
+			float foff[def_velocity_set];
+			neighbors(xff, jff);
+			load_f_outgoing(xff, foff, fi, jff, t);
+			return fma(2.0f*q, f_i, (1.0f-2.0f*q)*foff[link_i]);
+		}
+		return f_i;
+	}
+	const float inv_2q = 0.5f/q;
+	return fma(inv_2q, f_i, (1.0f-inv_2q)*fhn[ref_i]);
+}
+)+R(void apply_bfl_ibb(float* fhn, const float* fon, const uxx n, const uxx* j, global fpxx* fi, const global uchar* flags, const ulong t, const global ulong* ibb_keys, const global uchar* ibb_q, const uint ibb_slot_mask) {
+	if(ibb_slot_mask==0u) return;
+	for(uint link_i=1u; link_i<def_velocity_set; link_i++) {
+		if(flags[j[link_i]]==(TYPE_S|TYPE_X)) {
+			const uint ref_i = reflected_link_i(link_i);
+			fhn[ref_i] = ibb_reconstructed_population(n, link_i, ref_i, j, fi, flags, t, ibb_keys, ibb_q, ibb_slot_mask, fhn, fon);
+		}
+	}
+}
+)+"#endif"+R( // INTERPOLATED_BOUNCE_BACK
+)+"#ifdef SURFACE"+R(
 )+R(void store_f_reconstructed(const uxx n, const float* fhn, global fpxx* fi, const uxx* j, const ulong t, const uchar* flagsj_su) { // store reconstructed gas DDFs, even: 1:1 like stream-in even, odd: 1:1 like stream-in odd
 	for(uint i=1u; i<def_velocity_set; i+=2u) { // Esoteric-Pull
 		if(flagsj_su[i+1u]==TYPE_G) store(fi, index_f(n   , t%2ul ? i    : i+1u), fhn[i   ]); // only store reconstructed gas DDFs to locations from which
@@ -1612,6 +1663,9 @@ string opencl_c_container() { return R( // ########################## begin of O
 
 
 )+R(kernel void stream_collide)+"("+R(global fpxx* fi, global float* rho, global float* u, global uchar* flags, const ulong t, const float fx, const float fy, const float fz // ) { // main LBM kernel
+)+"#ifdef INTERPOLATED_BOUNCE_BACK"+R(
+	, const global ulong* ibb_keys, const global uchar* ibb_q, const uint ibb_slot_mask // argument order is important
+)+"#endif"+R( // INTERPOLATED_BOUNCE_BACK
 )+"#ifdef FORCE_FIELD"+R(
 	, const global float* F // argument order is important
 )+"#endif"+R( // FORCE_FIELD
@@ -1636,6 +1690,15 @@ string opencl_c_container() { return R( // ########################## begin of O
 
 	float fhn[def_velocity_set]; // local DDFs
 	load_f(n, fhn, fi, j, t); // perform streaming (part 2)
+
+)+"#ifdef INTERPOLATED_BOUNCE_BACK"+R(
+	if((flagsn&TYPE_IBB)&&ibb_slot_mask!=0u) {
+		float fon[def_velocity_set];
+		fon[0] = fhn[0];
+		load_f_outgoing(n, fon, fi, j, t);
+		apply_bfl_ibb(fhn, fon, n, j, fi, flags, t, ibb_keys, ibb_q, ibb_slot_mask);
+	}
+)+"#endif"+R( // INTERPOLATED_BOUNCE_BACK
 
 )+"#ifdef MOVING_BOUNDARIES"+R(
 	if(flagsn_bo==TYPE_MS) apply_moving_boundaries(fhn, j, u, flags); // apply Dirichlet velocity boundaries if necessary (reads velocities of only neighboring boundary cells, which do not change during simulation)
@@ -2174,6 +2237,80 @@ string opencl_c_container() { return R( // ########################## begin of O
 		}
 	}
 } // object_force_by_link()
+
+)+"#ifdef INTERPOLATED_BOUNCE_BACK"+R(
+)+R(kernel void object_force_ibb(global fpxx* fi, const global uchar* flags, const ulong t, const uchar flag_marker, const global ulong* ibb_keys, const global uchar* ibb_q, const uint ibb_slot_mask, volatile global float* object_sum) {
+	const uxx n = get_global_id(0);
+	const uint lid = get_local_id(0);
+	local float3 cache[cl_workgroup_size];
+	float3 Fn = (float3)(0.0f, 0.0f, 0.0f);
+	if(n<(uxx)def_N&&!is_halo(n)&&(flags[n]&TYPE_IBB)&&ibb_slot_mask!=0u) {
+		uxx j[def_velocity_set];
+		float fhn[def_velocity_set], fon[def_velocity_set];
+		neighbors(n, j);
+		load_f(n, fhn, fi, j, t);
+		fon[0] = fhn[0];
+		load_f_outgoing(n, fon, fi, j, t);
+		for(uint link_i=1u; link_i<def_velocity_set; link_i++) {
+			if(flags[j[link_i]]==flag_marker) {
+				const uint ref_i = reflected_link_i(link_i);
+				const float f_ref = ibb_reconstructed_population(n, link_i, ref_i, j, fi, flags, t, ibb_keys, ibb_q, ibb_slot_mask, fhn, fon);
+				const float transfer = fon[link_i]+f_ref;
+				Fn += transfer*(float3)(c(link_i), c(def_velocity_set+link_i), c(2u*def_velocity_set+link_i));
+			}
+		}
+	}
+	cache[lid] = Fn;
+	barrier(CLK_GLOBAL_MEM_FENCE);
+	for(uint s=1u; s<cl_workgroup_size; s*=2u) {
+		if(lid%(2u*s)==0u) cache[lid] += cache[lid+s];
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+	if(lid==0u) {
+		const float3 local_sum = cache[0];
+		if(local_sum.x!=0.0f) atomic_add_f(&object_sum[0], local_sum.x);
+		if(local_sum.y!=0.0f) atomic_add_f(&object_sum[1], local_sum.y);
+		if(local_sum.z!=0.0f) atomic_add_f(&object_sum[2], local_sum.z);
+	}
+} // object_force_ibb()
+)+R(kernel void object_force_by_link_ibb(global fpxx* fi, const global uchar* flags, const ulong t, const uchar flag_marker, const global ulong* ibb_keys, const global uchar* ibb_q, const uint ibb_slot_mask, volatile global float* force_links) {
+	const uxx n = get_global_id(0);
+	const uint lid = get_local_id(0);
+	local float3 cache[def_velocity_set*cl_workgroup_size];
+	for(uint i=0u; i<def_velocity_set; i++) cache[i*cl_workgroup_size+lid] = (float3)(0.0f, 0.0f, 0.0f);
+	if(n<(uxx)def_N&&!is_halo(n)&&(flags[n]&TYPE_IBB)&&ibb_slot_mask!=0u) {
+		uxx j[def_velocity_set];
+		float fhn[def_velocity_set], fon[def_velocity_set];
+		neighbors(n, j);
+		load_f(n, fhn, fi, j, t);
+		fon[0] = fhn[0];
+		load_f_outgoing(n, fon, fi, j, t);
+		for(uint link_i=1u; link_i<def_velocity_set; link_i++) {
+			if(flags[j[link_i]]==flag_marker) {
+				const uint ref_i = reflected_link_i(link_i);
+				const float f_ref = ibb_reconstructed_population(n, link_i, ref_i, j, fi, flags, t, ibb_keys, ibb_q, ibb_slot_mask, fhn, fon);
+				const float transfer = fon[link_i]+f_ref;
+				cache[link_i*cl_workgroup_size+lid] = transfer*(float3)(c(link_i), c(def_velocity_set+link_i), c(2u*def_velocity_set+link_i));
+			}
+		}
+	}
+	barrier(CLK_LOCAL_MEM_FENCE);
+	for(uint s=1u; s<cl_workgroup_size; s*=2u) {
+		if(lid%(2u*s)==0u) {
+			for(uint i=0u; i<def_velocity_set; i++) cache[i*cl_workgroup_size+lid] += cache[i*cl_workgroup_size+lid+s];
+		}
+		barrier(CLK_LOCAL_MEM_FENCE);
+	}
+	if(lid==0u) {
+		for(uint i=0u; i<def_velocity_set; i++) {
+			const float3 local_sum = cache[i*cl_workgroup_size];
+			if(local_sum.x!=0.0f) atomic_add_f(&force_links[i], local_sum.x);
+			if(local_sum.y!=0.0f) atomic_add_f(&force_links[def_velocity_set+i], local_sum.y);
+			if(local_sum.z!=0.0f) atomic_add_f(&force_links[2u*def_velocity_set+i], local_sum.z);
+		}
+	}
+} // object_force_by_link_ibb()
+)+"#endif"+R( // INTERPOLATED_BOUNCE_BACK
 )+R(kernel void object_torque(const global float* F, const global uchar* flags, const uchar flag_marker, const float cx, const float cy, const float cz, volatile global float* object_sum) {
 	const uxx n = get_global_id(0); // n = x+(y+z*Ny)*Nx
 	const uint lid = get_local_id(0); // local memory reduction of cl_workgroup_size:1

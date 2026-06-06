@@ -129,6 +129,12 @@ void LBM_Domain::allocate(Device& device) {
 	kernel_stream_collide = Kernel(device, N, "stream_collide", fi, rho, u, flags, t, fx, fy, fz);
 	kernel_update_fields = Kernel(device, N, "update_fields", fi, rho, u, flags, t, fx, fy, fz);
 
+#ifdef INTERPOLATED_BOUNCE_BACK
+	ibb_keys = Memory<ulong>(device, 1u, 1u, true, true, max_ulong);
+	ibb_q = Memory<uchar>(device, 1u, 1u, true, true, (uchar)0u);
+	kernel_stream_collide.add_parameters(ibb_keys, ibb_q, ibb_slot_mask);
+#endif // INTERPOLATED_BOUNCE_BACK
+
 #ifdef FORCE_FIELD
 	F = Memory<float>(device, N, 3u);
 	object_sum = Memory<float>(device, 1u, 4u); // x, y, z, cell count
@@ -140,6 +146,10 @@ void LBM_Domain::allocate(Device& device) {
 	kernel_object_center_of_mass = Kernel(device, N, "object_center_of_mass", flags, (uchar)0u, object_sum);
 	kernel_object_force = Kernel(device, N, "object_force", F, flags, (uchar)0u, object_sum);
 	kernel_object_force_by_link = Kernel(device, N, "object_force_by_link", fi, flags, t, (uchar)0u, object_force_links);
+#ifdef INTERPOLATED_BOUNCE_BACK
+	kernel_object_force_ibb = Kernel(device, N, "object_force_ibb", fi, flags, t, (uchar)0u, ibb_keys, ibb_q, ibb_slot_mask, object_sum);
+	kernel_object_force_by_link_ibb = Kernel(device, N, "object_force_by_link_ibb", fi, flags, t, (uchar)0u, ibb_keys, ibb_q, ibb_slot_mask, object_force_links);
+#endif // INTERPOLATED_BOUNCE_BACK
 	kernel_object_torque = Kernel(device, N, "object_torque", F, flags, (uchar)0u, 0.0f, 0.0f, 0.0f, object_sum);
 #endif // FORCE_FIELD
 
@@ -198,6 +208,26 @@ void LBM_Domain::enqueue_update_fields() { // update fields (rho, u, T) manually
 	}
 #endif // UPDATE_FIELDS
 }
+#ifdef INTERPOLATED_BOUNCE_BACK
+void LBM_Domain::upload_ibb_table(const vector<ulong>& keys, const vector<uchar>& q, const uint slot_mask) {
+	const ulong slots = max((ulong)keys.size(), 1ull);
+	ibb_keys = Memory<ulong>(device, slots, 1u, true, true, max_ulong);
+	ibb_q = Memory<uchar>(device, slots, 1u, true, true, (uchar)0u);
+	for(ulong i=0ull; i<(ulong)keys.size(); i++) {
+		ibb_keys[i] = keys[i];
+		ibb_q[i] = q[i];
+	}
+	ibb_keys.write_to_device();
+	ibb_q.write_to_device();
+	ibb_slot_mask = slot_mask;
+	ibb_active = slot_mask!=0u&&keys.size()>1ull;
+	kernel_stream_collide.set_parameters(8u, ibb_keys, ibb_q, ibb_slot_mask);
+#ifdef FORCE_FIELD
+	kernel_object_force_ibb.set_parameters(4u, ibb_keys, ibb_q, ibb_slot_mask);
+	kernel_object_force_by_link_ibb.set_parameters(4u, ibb_keys, ibb_q, ibb_slot_mask);
+#endif // FORCE_FIELD
+}
+#endif // INTERPOLATED_BOUNCE_BACK
 #ifdef SURFACE
 void LBM_Domain::enqueue_surface_0() {
 	kernel_surface_0.set_parameters(7u, t, fx, fy, fz).enqueue_run();
@@ -228,6 +258,17 @@ void LBM_Domain::enqueue_object_center_of_mass(const uchar flag_marker) { // cal
 	object_sum.enqueue_read_from_device();
 }
 void LBM_Domain::enqueue_object_force(const uchar flag_marker) { // add up force for all cells flagged with flag_marker
+#ifdef INTERPOLATED_BOUNCE_BACK
+	if(has_ibb_table()&&flag_marker==(TYPE_S|TYPE_X)) {
+		object_sum.x[0] = 0.0f;
+		object_sum.y[0] = 0.0f;
+		object_sum.z[0] = 0.0f;
+		object_sum.enqueue_write_to_device();
+		kernel_object_force_ibb.set_parameters(2u, t, flag_marker).enqueue_run();
+		object_sum.enqueue_read_from_device();
+		return;
+	}
+#endif // INTERPOLATED_BOUNCE_BACK
 	enqueue_update_force_field(); // update force field if it is not yet up-to-date
 	object_sum.x[0] = 0.0f; // reset object_sum
 	object_sum.y[0] = 0.0f;
@@ -238,6 +279,13 @@ void LBM_Domain::enqueue_object_force(const uchar flag_marker) { // add up force
 }
 void LBM_Domain::enqueue_object_force_by_link(const uchar flag_marker) { // add up force contributions binned by lattice link
 	object_force_links.reset(0.0f);
+#ifdef INTERPOLATED_BOUNCE_BACK
+	if(has_ibb_table()&&flag_marker==(TYPE_S|TYPE_X)) {
+		kernel_object_force_by_link_ibb.set_parameters(2u, t, flag_marker).enqueue_run();
+		object_force_links.enqueue_read_from_device();
+		return;
+	}
+#endif // INTERPOLATED_BOUNCE_BACK
 	kernel_object_force_by_link.set_parameters(2u, t, flag_marker).enqueue_run();
 	object_force_links.enqueue_read_from_device();
 }
@@ -417,6 +465,9 @@ string LBM_Domain::device_defines(const Device_Info& device_info) const { return
 #elif defined(TRT)
 	"\n	#define TRT"
 #endif // TRT
+#ifdef INTERPOLATED_BOUNCE_BACK
+	"\n	#define INTERPOLATED_BOUNCE_BACK"
+#endif // INTERPOLATED_BOUNCE_BACK
 
 	"\n	#define TYPE_S 0x01" // 0b00000001 // (stationary or moving) solid boundary
 	"\n	#define TYPE_E 0x02" // 0b00000010 // equilibrium boundary (inflow/outflow)
@@ -1053,6 +1104,19 @@ void LBM::update_fields() { // update fields (rho, u, T) manually
 void LBM::reset() { // reset simulation (takes effect in following run() call)
 	initialized = false;
 }
+
+#ifdef INTERPOLATED_BOUNCE_BACK
+void LBM::upload_ibb_table(const uint domain, const vector<ulong>& keys, const vector<uchar>& q, const uint slot_mask) {
+	if(domain>=get_D()) print_error("IBB table domain "+to_string(domain)+" is outside of domain count "+to_string(get_D())+".");
+	lbm_domain[domain]->upload_ibb_table(keys, q, slot_mask);
+}
+bool LBM::has_ibb_table() const {
+	for(uint d=0u; d<get_D(); d++) {
+		if(lbm_domain[d]->has_ibb_table()) return true;
+	}
+	return false;
+}
+#endif // INTERPOLATED_BOUNCE_BACK
 
 #ifdef FORCE_FIELD
 void LBM::update_force_field() { // calculate forces from fluid on TYPE_S cells

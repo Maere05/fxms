@@ -51,6 +51,8 @@ struct ForceValidationConfig {
 	bool init_steps_override = false;
 	bool sample_steps_override = false;
 	bool sample_interval_override = false;
+	bool ibb_enabled = true;
+	bool ibb_explicit = false;
 };
 
 struct ForceValidationCase {
@@ -94,10 +96,18 @@ struct ForceValidationBoundarySummary {
 };
 
 struct ForceValidationIbbSummary {
+	bool active = false;
 	ulong candidate_cells = 0ull;
 	ulong candidate_links = 0ull;
 	ulong sparse_hash_slots = 0ull;
 	ulong sparse_hash_bytes = 0ull;
+	ulong q_links = 0ull;
+	ulong q_missing_links = 0ull;
+	ulong q_lt_half_links = 0ull;
+	float q_min = 0.0f;
+	float q_mean = 0.0f;
+	float q_max = 0.0f;
+	uint hash_max_probe = 0u;
 };
 
 struct ForceValidationSample {
@@ -187,7 +197,7 @@ static string force_link_header_columns() {
 }
 
 static void write_force_validation_header(const string& path) {
-	write_file(path, "case,memory_mb,Nx,Ny,Nz,step,time_s,convective_time,sample_index,sample_count,Fx_N,Fy_drag_N,Fz_lift_N,Mx_Nm,My_Nm,Mz_Nm,Cd,Cl,Cs,mean_Fx_N,mean_Fy_drag_N,mean_Fz_lift_N,mean_Cd,mean_Cl,mean_Cs,Re,tau,nu_lbm,ref_area_m2,voxel_ref_area_m2,effective_ref_area_m2,ref_length_m,steps_per_Tc,init_steps,sample_steps,sample_interval,smagorinsky_c,ibb_candidate_cells,ibb_candidate_links,ibb_sparse_hash_bytes,wall_model,ww_A,ww_B"+force_link_header_columns()+"\n");
+	write_file(path, "case,memory_mb,Nx,Ny,Nz,step,time_s,convective_time,sample_index,sample_count,Fx_N,Fy_drag_N,Fz_lift_N,Mx_Nm,My_Nm,Mz_Nm,Cd,Cl,Cs,mean_Fx_N,mean_Fy_drag_N,mean_Fz_lift_N,mean_Cd,mean_Cl,mean_Cs,Re,tau,nu_lbm,ref_area_m2,voxel_ref_area_m2,effective_ref_area_m2,ref_length_m,steps_per_Tc,init_steps,sample_steps,sample_interval,smagorinsky_c,ibb_candidate_cells,ibb_candidate_links,ibb_sparse_hash_bytes,ibb_active,ibb_q_links,ibb_q_missing_links,ibb_q_lt_half_links,ibb_q_min,ibb_q_mean,ibb_q_max,ibb_hash_slots,ibb_hash_bytes,ibb_hash_max_probe,wall_model,ww_A,ww_B"+force_link_header_columns()+"\n");
 }
 
 #if defined(WALL_MODEL_SVBB) && defined(WALL_MODEL_DIAGNOSTICS)
@@ -356,9 +366,195 @@ static ForceValidationIbbSummary mark_ibb_candidate_links(LBM& lbm, const uchar 
 			}
 		}
 	}
-	s.sparse_hash_slots = next_power_of_two(s.candidate_links>0ull ? 2ull*s.candidate_links : 1ull);
-	s.sparse_hash_bytes = s.sparse_hash_slots*(sizeof(ulong)+sizeof(uchar));
 	return s;
+}
+
+static uint force_validation_reflected_link(const uint i) {
+	return (i&1u) ? i+1u : i-1u;
+}
+
+static uint force_validation_hash_ibb_key(const ulong key) {
+	ulong x = key;
+	x ^= x>>33u;
+	x *= 0xff51afd7ed558ccdull;
+	x ^= x>>33u;
+	x *= 0xc4ceb9fe1a85ec53ull;
+	x ^= x>>33u;
+	return (uint)x;
+}
+
+static bool segment_triangle_q(const float3& origin, const float3& direction, const float3& p0, const float3& p1, const float3& p2, float& q) {
+	const float3 u=p1-p0, v=p2-p0, w0=origin-p0, h=cross(direction, v), s=cross(w0, u);
+	const float det = dot(u, h);
+	if(fabs(det)<1.0E-7f) return false;
+	const float inv_det = 1.0f/det;
+	const float a = inv_det*dot(w0, h);
+	if(a<-1.0E-5f||a>1.0f+1.0E-5f) return false;
+	const float b = inv_det*dot(direction, s);
+	if(b<-1.0E-5f||a+b>1.0f+1.0E-5f) return false;
+	const float t = inv_det*dot(v, s);
+	if(t<=1.0E-5f||t>1.0f+1.0E-5f) return false;
+	q = clamp(t, 1.0f/255.0f, 1.0f);
+	return true;
+}
+
+struct IbbTriangleGrid {
+	float3 minp = float3(0.0f);
+	float bin_size = 4.0f;
+	uint3 bins = uint3(1u);
+	vector<vector<uint>> entries;
+	ulong index(const uint x, const uint y, const uint z) const { return (ulong)x+((ulong)y+(ulong)z*(ulong)bins.y)*(ulong)bins.x; }
+};
+
+static uint clamp_bin_index(const int v, const uint max_v) {
+	return (uint)clamp(v, 0, (int)max_v);
+}
+
+static IbbTriangleGrid build_ibb_triangle_grid(const Mesh* mesh) {
+	IbbTriangleGrid g;
+	g.minp = mesh->pmin-float3(2.0f);
+	const float3 maxp = mesh->pmax+float3(2.0f);
+	g.bins = uint3(max(to_uint(ceil((maxp.x-g.minp.x)/g.bin_size)), 1u), max(to_uint(ceil((maxp.y-g.minp.y)/g.bin_size)), 1u), max(to_uint(ceil((maxp.z-g.minp.z)/g.bin_size)), 1u));
+	g.entries = vector<vector<uint>>((ulong)g.bins.x*(ulong)g.bins.y*(ulong)g.bins.z);
+	for(uint tri=0u; tri<mesh->triangle_number; tri++) {
+		const float3 p0=mesh->p0[tri], p1=mesh->p1[tri], p2=mesh->p2[tri];
+		const float3 lo = float3(fmin(fmin(p0.x, p1.x), p2.x), fmin(fmin(p0.y, p1.y), p2.y), fmin(fmin(p0.z, p1.z), p2.z))-g.minp;
+		const float3 hi = float3(fmax(fmax(p0.x, p1.x), p2.x), fmax(fmax(p0.y, p1.y), p2.y), fmax(fmax(p0.z, p1.z), p2.z))-g.minp;
+		const uint x0=clamp_bin_index((int)floor(lo.x/g.bin_size), g.bins.x-1u), x1=clamp_bin_index((int)floor(hi.x/g.bin_size), g.bins.x-1u);
+		const uint y0=clamp_bin_index((int)floor(lo.y/g.bin_size), g.bins.y-1u), y1=clamp_bin_index((int)floor(hi.y/g.bin_size), g.bins.y-1u);
+		const uint z0=clamp_bin_index((int)floor(lo.z/g.bin_size), g.bins.z-1u), z1=clamp_bin_index((int)floor(hi.z/g.bin_size), g.bins.z-1u);
+		for(uint z=z0; z<=z1; z++) for(uint y=y0; y<=y1; y++) for(uint x=x0; x<=x1; x++) g.entries[g.index(x, y, z)].push_back(tri);
+	}
+	return g;
+}
+
+static bool find_ibb_q(const Mesh* mesh, const IbbTriangleGrid& grid, const float3& origin, const float3& direction, float& best_q) {
+	const float3 end = origin+direction;
+	const float3 lo = float3(fmin(origin.x, end.x), fmin(origin.y, end.y), fmin(origin.z, end.z))-grid.minp;
+	const float3 hi = float3(fmax(origin.x, end.x), fmax(origin.y, end.y), fmax(origin.z, end.z))-grid.minp;
+	const uint x0=clamp_bin_index((int)floor(lo.x/grid.bin_size), grid.bins.x-1u), x1=clamp_bin_index((int)floor(hi.x/grid.bin_size), grid.bins.x-1u);
+	const uint y0=clamp_bin_index((int)floor(lo.y/grid.bin_size), grid.bins.y-1u), y1=clamp_bin_index((int)floor(hi.y/grid.bin_size), grid.bins.y-1u);
+	const uint z0=clamp_bin_index((int)floor(lo.z/grid.bin_size), grid.bins.z-1u), z1=clamp_bin_index((int)floor(hi.z/grid.bin_size), grid.bins.z-1u);
+	bool found = false;
+	best_q = 1.0f;
+	vector<uint> seen;
+	for(uint z=z0; z<=z1; z++) for(uint y=y0; y<=y1; y++) for(uint x=x0; x<=x1; x++) {
+		const vector<uint>& triangles = grid.entries[grid.index(x, y, z)];
+		for(uint tri : triangles) {
+			if(contains(seen, tri)) continue;
+			seen.push_back(tri);
+			float q = 0.0f;
+			if(segment_triangle_q(origin, direction, mesh->p0[tri], mesh->p1[tri], mesh->p2[tri], q)&&q<best_q) {
+				best_q = q;
+				found = true;
+			}
+		}
+	}
+	return found;
+}
+
+struct IbbDomainEntries {
+	vector<ulong> keys;
+	vector<uchar> values;
+	uint max_probe = 0u;
+};
+
+static bool insert_ibb_hash_entry(vector<ulong>& keys, vector<uchar>& values, const uint mask, const ulong key, const uchar q, uint& max_probe) {
+	uint slot = force_validation_hash_ibb_key(key)&mask;
+	for(uint probe=0u; probe<32u; probe++) {
+		if(values[slot]==0u||keys[slot]==key) {
+			keys[slot] = key;
+			values[slot] = q;
+			max_probe = max(max_probe, probe+1u);
+			return true;
+		}
+		slot = (slot+1u)&mask;
+	}
+	return false;
+}
+
+static void upload_ibb_domain_table(LBM& lbm, const uint domain, const vector<std::pair<ulong, uchar>>& entries, ForceValidationIbbSummary& summary) {
+	ulong slots = next_power_of_two(max(4ull*(ulong)entries.size(), 1ull));
+	vector<ulong> keys;
+	vector<uchar> values;
+	uint max_probe = 0u;
+	while(true) {
+		keys = vector<ulong>(slots, max_ulong);
+		values = vector<uchar>(slots, (uchar)0u);
+		max_probe = 0u;
+		bool ok = true;
+		for(const auto& e : entries) {
+			if(!insert_ibb_hash_entry(keys, values, (uint)(slots-1ull), e.first, e.second, max_probe)) {
+				ok = false;
+				break;
+			}
+		}
+		if(ok) break;
+		slots *= 2ull;
+		if(slots*(sizeof(ulong)+sizeof(uchar))>268435456ull) print_error("IBB sparse hash table exceeded 256 MB while building domain "+to_string(domain)+".");
+	}
+	lbm.upload_ibb_table(domain, keys, values, entries.size()>0u ? (uint)(slots-1ull) : 0u);
+	summary.sparse_hash_slots += slots;
+	summary.sparse_hash_bytes += slots*(sizeof(ulong)+sizeof(uchar));
+	summary.hash_max_probe = max(summary.hash_max_probe, max_probe);
+}
+
+static ForceValidationIbbSummary build_and_upload_ibb_q_table(LBM& lbm, const Mesh* mesh, const uchar object_flag, const VoxelizedObjectBounds& bounds, ForceValidationIbbSummary summary) {
+#ifndef INTERPOLATED_BOUNCE_BACK
+	(void)lbm; (void)mesh; (void)object_flag; (void)bounds;
+	return summary;
+#else
+	if(!bounds.valid||summary.candidate_links==0ull||!force_validation_config.ibb_enabled) return summary;
+	lbm.flags.write_to_device();
+	const IbbTriangleGrid grid = build_ibb_triangle_grid(mesh);
+	const uint Nx=lbm.get_Nx(), Ny=lbm.get_Ny(), Nz=lbm.get_Nz(), Dx=lbm.get_Dx(), Dy=lbm.get_Dy(), Dz=lbm.get_Dz();
+	const uint Hx=Dx>1u, Hy=Dy>1u, Hz=Dz>1u, NxDx=Nx/Dx, NyDy=Ny/Dy, NzDz=Nz/Dz;
+	const ulong local_Nx=(ulong)(NxDx+2u*Hx), local_Ny=(ulong)(NyDy+2u*Hy);
+	vector<vector<std::pair<ulong, uchar>>> entries(lbm.get_D());
+	float q_sum = 0.0f;
+	summary.q_min = 1.0f;
+	summary.q_max = 0.0f;
+	for(uint z=bounds.min.z>0u ? bounds.min.z-1u : 0u; z<=min(bounds.max.z+1u, Nz-1u); z++) {
+		for(uint y=bounds.min.y>0u ? bounds.min.y-1u : 0u; y<=min(bounds.max.y+1u, Ny-1u); y++) {
+			for(uint x=bounds.min.x>0u ? bounds.min.x-1u : 0u; x<=min(bounds.max.x+1u, Nx-1u); x++) {
+				const ulong n = lbm.index(x, y, z);
+				if((lbm.flags[n]&TYPE_IBB)==0u) continue;
+				const uint px=x%NxDx, py=y%NyDy, pz=z%NzDz, dx=x/NxDx, dy=y/NyDy, dz=z/NzDz, domain=dx+(dy+dz*Dy)*Dx;
+				const ulong local_n = (ulong)(px+Hx)+((ulong)(py+Hy)+(ulong)(pz+Hz)*local_Ny)*local_Nx;
+				for(uint i=1u; i<force_validation_velocity_set; i++) {
+					const uint xn = (uint)(((int)x+force_validation_link_c(0u, i)+(int)Nx)%(int)Nx);
+					const uint yn = (uint)(((int)y+force_validation_link_c(1u, i)+(int)Ny)%(int)Ny);
+					const uint zn = (uint)(((int)z+force_validation_link_c(2u, i)+(int)Nz)%(int)Nz);
+					if(lbm.flags[lbm.index(xn, yn, zn)]!=object_flag) continue;
+					float q = 0.5f;
+					const float3 origin = float3((float)x, (float)y, (float)z);
+					const float3 direction = float3((float)force_validation_link_c(0u, i), (float)force_validation_link_c(1u, i), (float)force_validation_link_c(2u, i));
+					if(!find_ibb_q(mesh, grid, origin, direction, q)) {
+						summary.q_missing_links++;
+						q = 0.5f;
+					}
+					const uchar q_u8 = (uchar)clamp(to_uint(round(255.0f*q)), 1u, 255u);
+					const ulong key = (local_n<<5u)|(ulong)i;
+					entries[domain].push_back(std::pair<ulong, uchar>(key, q_u8));
+					summary.q_links++;
+					if(q<0.5f) summary.q_lt_half_links++;
+					summary.q_min = fmin(summary.q_min, q);
+					summary.q_max = fmax(summary.q_max, q);
+					q_sum += q;
+				}
+			}
+		}
+	}
+	if(summary.q_links==0ull) {
+		summary.q_min = summary.q_mean = summary.q_max = 0.0f;
+		return summary;
+	}
+	summary.q_mean = q_sum/(float)summary.q_links;
+	summary.active = true;
+	for(uint d=0u; d<lbm.get_D(); d++) upload_ibb_domain_table(lbm, d, entries[d], summary);
+	if(summary.sparse_hash_bytes>268435456ull) print_error("IBB sparse hash tables use "+to_string(summary.sparse_hash_bytes)+" bytes, exceeding the 256 MB cap.");
+	return summary;
+#endif // INTERPOLATED_BOUNCE_BACK
 }
 
 static ulong count_cells_equal_flag(LBM& lbm, const uchar flag) {
@@ -497,6 +693,9 @@ static ForceValidationSample append_force_sample(const ForceValidationCase& c, c
 		csv_float(c.si_ref_area)+","+csv_float(bounds.valid ? bounds.si_frontal_area : 0.0f)+","+csv_float(ref_area)+","+csv_float(c.si_ref_length)+","+
 		to_string(schedule.steps_per_Tc)+","+to_string(schedule.init_steps)+","+to_string(schedule.sample_steps)+","+to_string(schedule.sample_interval)+","+csv_float(lbm_smagorinsky_C)+","+
 		to_string(ibb.candidate_cells)+","+to_string(ibb.candidate_links)+","+to_string(ibb.sparse_hash_bytes)+","+
+		to_string((uint)ibb.active)+","+to_string(ibb.q_links)+","+to_string(ibb.q_missing_links)+","+to_string(ibb.q_lt_half_links)+","+
+		csv_float(ibb.q_min)+","+csv_float(ibb.q_mean)+","+csv_float(ibb.q_max)+","+
+		to_string(ibb.sparse_hash_slots)+","+to_string(ibb.sparse_hash_bytes)+","+to_string(ibb.hash_max_probe)+","+
 		wall_model_name()+","+csv_float(wall_model_ww_A())+","+csv_float(wall_model_ww_B())+
 		force_link_csv_values(sample.force_by_link)+mean_force_link_csv_values(stats.force_by_link_sum, stats.samples));
 	return sample;
@@ -547,7 +746,8 @@ static void run_force_validation_case(const ForceValidationCase& c, const int me
 		" ground_solid_cells="+to_string(boundary_summary.ground_solid_cells)+
 		" equilibrium_boundary_cells="+to_string(boundary_summary.equilibrium_boundary_cells)+
 		" other_boundary_cells="+to_string(boundary_summary.other_boundary_cells));
-	const ForceValidationIbbSummary ibb_summary = c.name=="ahmed" ? mark_ibb_candidate_links(lbm, TYPE_S|TYPE_X, bounds) : ForceValidationIbbSummary();
+	ForceValidationIbbSummary ibb_summary = c.name=="ahmed" ? mark_ibb_candidate_links(lbm, TYPE_S|TYPE_X, bounds) : ForceValidationIbbSummary();
+	ibb_summary = c.name=="ahmed" ? build_and_upload_ibb_q_table(lbm, mesh, TYPE_S|TYPE_X, bounds, ibb_summary) : ibb_summary;
 	if(c.name=="ahmed") {
 		print_info("FORCE_VALIDATION_IBB_CANDIDATES case="+c.name+
 			" cells="+to_string(ibb_summary.candidate_cells)+
@@ -555,6 +755,17 @@ static void run_force_validation_case(const ForceValidationCase& c, const int me
 			" sparse_hash_slots="+to_string(ibb_summary.sparse_hash_slots)+
 			" sparse_hash_bytes="+to_string(ibb_summary.sparse_hash_bytes)+
 			" marker=TYPE_IBB");
+		print_info("FORCE_VALIDATION_IBB_Q case="+c.name+
+			" active="+to_string((uint)ibb_summary.active)+
+			" q_links="+to_string(ibb_summary.q_links)+
+			" missing_links="+to_string(ibb_summary.q_missing_links)+
+			" q_lt_half_links="+to_string(ibb_summary.q_lt_half_links)+
+			" q_min="+csv_float(ibb_summary.q_min)+
+			" q_mean="+csv_float(ibb_summary.q_mean)+
+			" q_max="+csv_float(ibb_summary.q_max)+
+			" hash_slots="+to_string(ibb_summary.sparse_hash_slots)+
+			" hash_bytes="+to_string(ibb_summary.sparse_hash_bytes)+
+			" hash_max_probe="+to_string(ibb_summary.hash_max_probe));
 	}
 #ifdef GRAPHICS
 	lbm.graphics.visualization_modes = VIS_FLAG_LATTICE|VIS_FLAG_SURFACE;
@@ -679,7 +890,7 @@ void sim_skijumper(int memory_in_mb) {
 }
 
 static void print_force_validation_usage() {
-	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [--smagorinsky C] [--domains Dx,Dy,Dz] [--init-steps N] [--sample-steps N] [--sample-interval N] [gpu_id ...]");
+	print_info("Force validation usage: FluidX3D.exe [all|naca|ahmed|skijumper] [memory_mb] [--smagorinsky C] [--domains Dx,Dy,Dz] [--init-steps N] [--sample-steps N] [--sample-interval N] [--ibb|--no-ibb] [gpu_id ...]");
 	print_info("Defaults: ahmed 2000 0");
 }
 
@@ -745,6 +956,12 @@ void main_setup() {
 		} else if(begins_with(arg, "--sample-interval=")) {
 			force_validation_config.sample_interval = to_ulong(substring(main_arguments[i], 18u));
 			force_validation_config.sample_interval_override = true;
+		} else if(arg=="--ibb") {
+			force_validation_config.ibb_enabled = true;
+			force_validation_config.ibb_explicit = true;
+		} else if(arg=="--no-ibb") {
+			force_validation_config.ibb_enabled = false;
+			force_validation_config.ibb_explicit = true;
 		} else {
 			gpu_arguments.push_back(main_arguments[i]);
 		}

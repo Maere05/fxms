@@ -33,6 +33,7 @@
 //#define WALL_MODEL_SVBB_OBJECT_ONLY // experimental: apply SVBB only to TYPE_S|TYPE_X object links
 //#define WALL_MODEL_SVBB_FLOOR_ONLY // experimental: apply SVBB only to plain TYPE_S links
 //#define WALL_MODEL_DIAGNOSTICS // records tiny global diagnostics for WALL_MODEL_SVBB wall-link corrections
+#define INTERPOLATED_BOUNCE_BACK // enables sparse Bouzidi-Firdaouss-Lallemand q tables for object STL boundaries
 //#define PARTICLES // enables particles with immersed-boundary method (for 2-way coupling also activate VOLUME_FORCE and FORCE_FIELD; only supported in single-GPU)
 
 //#define INTERACTIVE_GRAPHICS // enable interactive graphics; start/pause the simulation by pressing P; either Windows or Linux X11 desktop must be available; on Linux: change to "compile on Linux with X11" command in make.sh
