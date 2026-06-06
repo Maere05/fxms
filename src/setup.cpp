@@ -343,7 +343,7 @@ static ForceValidationIbbSummary mark_ibb_candidate_links(LBM& lbm, const uchar 
 			lbm.flags[n] = lbm.flags[n]|TYPE_IBB;
 		}
 	}
-	s.sparse_hash_slots = next_power_of_two(max(2ull*s.candidate_links, 1ull));
+	s.sparse_hash_slots = next_power_of_two(s.candidate_links>0ull ? 2ull*s.candidate_links : 1ull);
 	s.sparse_hash_bytes = s.sparse_hash_slots*(sizeof(ulong)+sizeof(uchar));
 	return s;
 }
